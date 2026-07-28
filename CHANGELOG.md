@@ -10,6 +10,12 @@ The LiteX M2 SDR project is actively under development. We maintain this changel
 - Fixed zero-copy DMA mmap on IOMMU/SMMU platforms (e.g. Jetson Orin): the kernel driver mapped the wrong pages on ARM/AArch64, so SoapySDR RX delivered mostly-zero buffers while the copy-mode tools streamed correctly (#149).
 - Added opt-in FPGA <-> AD9361 interface delay calibration to the SoapySDR driver (`calibrate_delay=1`) with cached delays re-applied across RFIC reconfigurations, plus the matching `libm2sdr` interface-delay API.
 
+**Kernel Driver PCIe Fault Handling**
+- Added PCIe error recovery to the kernel driver: AER/DPC events now reach `error_detected`/`slot_reset`/`resume` handlers that stop using the device, re-initialize the core after the reset, and retire the file descriptors the reset invalidated, so a fatal link error no longer leaves the board dead until the host is rebooted (#156).
+- Bounded the probe identifier read on an unreachable core: the driver bails out on the first all-ones word instead of issuing 256 MMIO reads that each cost a full PCIe completion timeout, which stalled the machine for ~1 minute per failed probe (#156).
+- Ratelimited the DMA overrun/underrun messages, which could otherwise flood the log with thousands of lines during a stream overrun and starve the CPU the stream needed to catch up (#156).
+- Made DMA teardown wait for the engines to report idle before the coherent buffers behind their descriptors are released (#156).
+
 [> 2026-05-15 First Date-Named Release
 --------------------------------------
 **Feature Status at Release**
