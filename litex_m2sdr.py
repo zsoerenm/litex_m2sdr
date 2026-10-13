@@ -158,7 +158,7 @@ def get_eth_phy_kwargs(eth_phy):
 
 class CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq, with_eth=False, eth_refclk_freq=125e6,
-        eth_refclk_direct=False, with_sata=False, with_white_rabbit=False):
+        eth_refclk_direct=False, with_sata=False, with_white_rabbit=False, sync_slave=False):
         self.rst              = Signal()
         self.cd_sys           = ClockDomain()
         self.cd_clk10         = ClockDomain()
@@ -182,18 +182,32 @@ class CRG(LiteXModule):
         # Clk / Rst.
         # ----------
         clk100 = platform.request("clk100")
+        clk_rst = Signal()
+        if sync_slave:
+            clk100 = self.add_sync_slave_ref(clk100)
+            clk_rst = self.ref_switch_rst
+            # Second input of the PLL/MMCM: the CN6-derived 100MHz, selected by ref_sel_cn6.
+            ref_inputs = dict(
+                p_CLKIN2_PERIOD = 10.0,
+                i_CLKIN2        = self.cd_cn6_100.clk,
+                i_CLKINSEL      = ~self.ref_sel_cn6,  # 1: CLKIN1 (local), 0: CLKIN2 (CN6).
+            )
 
         # PLL.
         # ----
         self.pll = pll = S7PLL(speedgrade=-3)
-        self.comb += self.pll.reset.eq(self.rst)
+        self.comb += self.pll.reset.eq(self.rst | clk_rst)
         pll.register_clkin(clk100, 100e6)
+        if sync_slave:
+            pll.params.update(ref_inputs)
         pll.create_clkout(self.cd_sys,    sys_clk_freq)
         if not with_white_rabbit:
             # Keep clk10 on a dedicated MMCM so the SI5351C FPGA CLKIN path can be phase-steered later.
             self.clk10_mmcm = clk10_mmcm = S7MMCM(speedgrade=-3, fractional=False)
-            self.comb += clk10_mmcm.reset.eq(self.rst)
+            self.comb += clk10_mmcm.reset.eq(self.rst | clk_rst)
             clk10_mmcm.register_clkin(clk100, 100e6)
+            if sync_slave:
+                clk10_mmcm.params.update(ref_inputs)
             clk10_mmcm.expose_dps("clk200", with_csr=False)
             clk10_mmcm.create_clkout(self.cd_clk10, 10e6, margin=0)
             clk10_mmcm.params.update(p_CLKOUT0_USE_FINE_PS="TRUE")
@@ -252,6 +266,66 @@ class CRG(LiteXModule):
             self.dmtd_mmcm.create_clkout(self.cd_clk_62m5_dmtd, 62.5e6, margin=0)
             self.dmtd_mmcm.expose_dps("clk200", with_csr=False)
             self.dmtd_mmcm.params.update(p_CLKOUT0_USE_FINE_PS="TRUE")
+
+    def add_sync_slave_ref(self, clk100_pad):
+        """Run the FPGA clocks of a clock-slave board from the master's 10MHz on CN6.
+
+        The received 10MHz (self.cn6_in, connected by the SoC) is multiplied to 100MHz by an MMCM
+        and fed to the second clock input of the main PLL and the clk10 MMCM. Once it has been
+        locked for ~10ms it is selected instead of the local 100MHz oscillator; on loss of lock the
+        local oscillator is selected again. The selection runs from the local oscillator, needs no
+        software and resets the PLL/MMCM on every switch (the sys domain is reset; the PCIe link,
+        reset only by PERST, stays up). With every FPGA clock derived from the shared reference,
+        on-chip coupling into the reference path can only add a constant phase instead of beat
+        spurs at (n x 125MHz) x (oscillator offset).
+        Returns the local oscillator (BUFG output) for CLKIN1: with clock switching, CLKIN1 and
+        CLKIN2 must come from the same buffer type (DRC REQP-119).
+        """
+        self.cn6_in          = Signal()
+        self.ref_switch_rst  = Signal()
+        self.ref_sel_cn6     = Signal()
+        self.cd_clk100_local = ClockDomain(reset_less=True)
+        self.cd_cn6_100      = ClockDomain(reset_less=True)
+
+        # Local 100MHz oscillator: one BUFG for CLKIN1 and the selection logic.
+        clk100_ibuf = Signal()
+        self.specials += [
+            Instance("IBUF", i_I=clk100_pad, o_O=clk100_ibuf),
+            Instance("BUFG", i_I=clk100_ibuf, o_O=self.cd_clk100_local.clk),
+        ]
+
+        # CN6 10MHz -> 100MHz. The explicit BUFG keeps Vivado from inserting a second input buffer
+        # on the bidirectional CN6 pad.
+        cn6_bufg = Signal()
+        self.specials += Instance("BUFG", name="cn6_bufg", i_I=self.cn6_in, o_O=cn6_bufg)
+        self.cn6_mmcm = cn6_mmcm = S7MMCM(speedgrade=-3, name="cn6_mmcm")
+        cn6_mmcm.register_clkin(cn6_bufg, 10e6)
+        cn6_mmcm.create_clkout(self.cd_cn6_100, 100e6, with_reset=False, margin=0)
+
+        # Selection (local oscillator domain, always running).
+        cn6_locked = Signal()
+        stable     = Signal(21)  # 2^20 cycles = 10.5ms locked before switching to CN6.
+        retry      = Signal(24)  # While unlocked, reset the CN6 MMCM every 168ms to re-acquire.
+        rst_cnt    = Signal(12)
+        self.specials += MultiReg(cn6_mmcm.locked, cn6_locked, odomain="clk100_local")
+        self.comb += cn6_mmcm.reset.eq(retry[23] & (retry[10:23] == 0))
+        self.sync.clk100_local += [
+            If(cn6_locked,
+                If(~stable[20], stable.eq(stable + 1)),
+                retry.eq(0),
+            ).Else(
+                stable.eq(0),
+                retry.eq(retry + 1),
+            ),
+            If(stable[20] != self.ref_sel_cn6,
+                self.ref_sel_cn6.eq(stable[20]),
+                rst_cnt.eq(2**12 - 1),
+            ).Elif(rst_cnt != 0,
+                rst_cnt.eq(rst_cnt - 1),
+            ),
+            self.ref_switch_rst.eq(rst_cnt != 0),
+        ]
+        return self.cd_clk100_local.clk
 
 # SyncClkOut ---------------------------------------------------------------------------------------
 
@@ -380,6 +454,7 @@ class BaseSoC(SoCMini):
         with_gpio              = False,
         pps_input              = "m2",
         with_rfic_oversampling = False,
+        with_sync_slave        = False,
     ):
         if pps_input in ("tp1", "tp2") and with_gpio:
             raise ValueError("PPS input on TP1/TP2 cannot be used with --with-gpio.")
@@ -441,6 +516,7 @@ class BaseSoC(SoCMini):
             eth_refclk_direct = with_eth and (eth_phy == "2500basex"),
             with_sata         = with_sata,
             with_white_rabbit = with_white_rabbit,
+            sync_slave        = with_sync_slave,
         )
 
         # Shared QPLL.
@@ -509,6 +585,19 @@ class BaseSoC(SoCMini):
 
         # SI5351 ClkIn Ext/uFL + switchable 10MHz ClkOut on the same pin (SYNCDBG_CLK/CN6).
         self.sync_clk_out = SyncClkOut(pad=platform.request("sync_clk_in"))
+        if with_sync_slave:
+            # FPGA clocks follow the 10MHz received on CN6 (clock-slave boards only, see CRG).
+            self.comb += self.crg.cn6_in.eq(self.sync_clk_out.i)
+            platform.add_platform_command(
+                "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins -hierarchical -filter {{NAME =~ *cn6_bufg/I}}]]")
+            # Every PLL/MMCM output exists twice (local oscillator / CN6 reference), never both at once.
+            platform.toolchain.pre_placement_commands += [
+                "set _local [get_clocks -quiet -include_generated_clocks clk100]",
+                "set _cn6 [get_clocks -quiet -include_generated_clocks -of_objects [get_pins -hierarchical -filter {{NAME =~ *cn6_mmcm/CLKOUT0}}]]",
+                "if {{[llength $_local] && [llength $_cn6]}} {{",
+                "    set_clock_groups -physically_exclusive -group $_local -group $_cn6",
+                "}}",
+            ]
         self.comb += self.si5351.clkin_ufl.eq(self.sync_clk_out.i)
 
         # SI5351 ClkIn/Out.
@@ -1690,6 +1779,7 @@ def main():
 
     # RFIC parameters.
     parser.add_argument("--with-rfic-oversampling", action="store_true", help="Double the RFIC clock to enable the oversampling mode.")
+    parser.add_argument("--with-sync-slave",        action="store_true", help="Clock-slave board: run the FPGA clocks from the 10MHz on CN6 once present (do not use on the clock master).")
 
     # PCIe parameters.
     parser.add_argument("--with-pcie",       action="store_true", help="Enable PCIe Communication.")
@@ -1795,6 +1885,7 @@ def main():
 
         # RFIC.
         with_rfic_oversampling = args.with_rfic_oversampling,
+        with_sync_slave        = args.with_sync_slave,
 
         # PCIe.
         with_pcie     = args.with_pcie,
@@ -1894,6 +1985,8 @@ def main():
                 r += f"_{args.wr_cpu_boot}"
         if args.with_rfic_oversampling:
             r += "_rfic_oversampling"
+        if args.with_sync_slave:
+            r += "_sync_slave"
         if args.without_jtagbone:
             r += "_no_jtagbone"
         return r
