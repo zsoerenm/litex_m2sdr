@@ -479,6 +479,11 @@ enum m2sdr_feature_flag {
 #else
     M2SDR_FEATURE_RFIC_OVERSAMPLING = 0,
 #endif
+#ifdef CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_OFFSET
+    M2SDR_FEATURE_SYNC_CLK_OUT = 1u << CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_OFFSET,
+#else
+    M2SDR_FEATURE_SYNC_CLK_OUT = 0,
+#endif
 };
 
 enum m2sdr_feature_mask {
@@ -534,6 +539,11 @@ enum m2sdr_feature_mask {
     M2SDR_FEATURE_RFIC_OVERSAMPLING_MASK = ((1u << CSR_CAPABILITY_FEATURES_RFIC_OVERSAMPLING_SIZE) - 1u) << CSR_CAPABILITY_FEATURES_RFIC_OVERSAMPLING_OFFSET,
 #else
     M2SDR_FEATURE_RFIC_OVERSAMPLING_MASK = 0,
+#endif
+#ifdef CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_SIZE
+    M2SDR_FEATURE_SYNC_CLK_OUT_MASK = ((1u << CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_SIZE) - 1u) << CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_OFFSET,
+#else
+    M2SDR_FEATURE_SYNC_CLK_OUT_MASK = 0,
 #endif
 };
 
@@ -737,6 +747,11 @@ int  m2sdr_set_ptp_clock10_config(struct m2sdr_dev *dev, const struct m2sdr_ptp_
 int  m2sdr_clear_ptp_clock10_counters(struct m2sdr_dev *dev);
 /* Queue a clk10 marker realignment; hardware applies it on the next PTP reference edge. */
 int  m2sdr_align_ptp_clock10(struct m2sdr_dev *dev);
+/* Drive the FPGA 10MHz reference (clk10) out on the SYNCDBG_CLK/CN6 pin so a second board can
+ * use it with the external clock source. Off after power-on. Enable it on one board only.
+ * Returns M2SDR_ERR_UNSUPPORTED when the gateware does not advertise M2SDR_FEATURE_SYNC_CLK_OUT. */
+int  m2sdr_set_sync_clk_out(struct m2sdr_dev *dev, bool enable);
+int  m2sdr_get_sync_clk_out(struct m2sdr_dev *dev, bool *enabled);
 int  m2sdr_set_agc_pin(struct m2sdr_dev *dev, bool enable);
 int  m2sdr_get_agc_pin(struct m2sdr_dev *dev, bool *enabled);
 int  m2sdr_configure_agc_counter(struct m2sdr_dev *dev,

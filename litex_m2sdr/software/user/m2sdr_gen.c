@@ -17,6 +17,7 @@
  *     ./m2sdr_gen -s 30.72e6 -t tone -f 1e6 -a 1.0
  *     ./m2sdr_gen -s 30.72e6 -t white -a 1.0
  *     ./m2sdr_gen -s 30.72e6 -t prbs -a 1.0
+ *     ./m2sdr_gen -s 7.68e6 -t multitone --tones 0.5e6:0.3,0.6e6:0.3,2e6:0.3
  *
  * TX control uses positive attenuation values across both the native and SoapySDR paths.
  *
@@ -212,6 +213,112 @@ static void ofdm_next_sample(struct ofdm_state *st, float *i_out, float *q_out)
     st->sample_index++;
 }
 
+/* Multitone: one exactly periodic table of len samples holding an integer number of periods of
+ * every tone, played back cyclically so there is no phase jump at DMA buffer boundaries. */
+#define MULTITONE_MAX_TONES   16
+#define MULTITONE_MAX_PERIOD  (1 << 20)
+
+struct multitone_state {
+    int num_tones;
+    double freq[MULTITONE_MAX_TONES];
+    double amp[MULTITONE_MAX_TONES];
+    size_t len;
+    size_t index;
+    float *table_i;
+    float *table_q;
+};
+
+static int multitone_parse(struct multitone_state *mt, const char *spec)
+{
+    char buf[1024];
+    char *saveptr = NULL;
+
+    memset(mt, 0, sizeof(*mt));
+    if (strlen(spec) >= sizeof(buf))
+        return -1;
+    strcpy(buf, spec);
+
+    for (char *tok = strtok_r(buf, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr)) {
+        char *end = NULL;
+        double freq, amp = 1.0;
+
+        if (mt->num_tones >= MULTITONE_MAX_TONES)
+            return -1;
+        freq = strtod(tok, &end);
+        if (end == tok)
+            return -1;
+        if (*end == ':') {
+            char *amp_str = end + 1;
+            amp = strtod(amp_str, &end);
+            if (end == amp_str || amp < 0.0)
+                return -1;
+        }
+        if (*end != '\0')
+            return -1;
+        mt->freq[mt->num_tones] = freq;
+        mt->amp[mt->num_tones]  = amp;
+        mt->num_tones++;
+    }
+    return mt->num_tones > 0 ? 0 : -1;
+}
+
+static int multitone_init(struct multitone_state *mt, double sample_rate)
+{
+    size_t len;
+    double amp_sum = 0.0;
+
+    /* Smallest table length holding an integer number of cycles of every tone. */
+    for (len = 1; len <= MULTITONE_MAX_PERIOD; len++) {
+        int ok = 1;
+        for (int k = 0; k < mt->num_tones; k++) {
+            double cycles = mt->freq[k] * (double)len / sample_rate;
+            if (fabs(cycles - round(cycles)) > 1e-6) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok)
+            break;
+    }
+    if (len > MULTITONE_MAX_PERIOD) {
+        fprintf(stderr, "multitone: no common period <= %d samples; choose tones on a coarser frequency grid\n",
+                MULTITONE_MAX_PERIOD);
+        return -1;
+    }
+
+    mt->len = len;
+    mt->index = 0;
+    mt->table_i = xcalloc(len, sizeof(*mt->table_i));
+    mt->table_q = xcalloc(len, sizeof(*mt->table_q));
+
+    for (int k = 0; k < mt->num_tones; k++) {
+        /* Integer cycles per table: phase is exactly continuous across the wrap. */
+        long cycles = lround(mt->freq[k] * (double)len / sample_rate);
+        mt->freq[k] = (double)cycles * sample_rate / (double)len;
+        amp_sum += mt->amp[k];
+        for (size_t n = 0; n < len; n++) {
+            double phi = 2.0 * M_PI * (double)((cycles * (long)n) % (long)len) / (double)len;
+            mt->table_i[n] += (float)(mt->amp[k] * cos(phi));
+            mt->table_q[n] += (float)(mt->amp[k] * sin(phi));
+        }
+    }
+
+    printf("  Multitone period: %zu samples (%.3f us)\n", len, 1e6 * (double)len / sample_rate);
+    for (int k = 0; k < mt->num_tones; k++)
+        printf("  Tone %d: %+.3f Hz, amplitude %.3f\n", k, mt->freq[k], mt->amp[k]);
+    if (amp_sum > 1.0)
+        fprintf(stderr, "multitone: warning, amplitude sum %.3f > 1.0 will clip\n", amp_sum);
+    return 0;
+}
+
+static void multitone_cleanup(struct multitone_state *mt)
+{
+    free(mt->table_i);
+    free(mt->table_q);
+    mt->table_i = NULL;
+    mt->table_q = NULL;
+}
+
 #ifdef CSR_GPIO_BASE
 static void m2sdr_write32(struct m2sdr_dev *dev, uint32_t addr, uint32_t val)
 {
@@ -235,6 +342,7 @@ struct gen_signal_state {
     uint64_t sample_count;
     uint32_t lfsr;
     struct ofdm_state *ofdm;
+    struct multitone_state *multitone;
 };
 
 static int8_t gen_float_to_sc8(float sample)
@@ -265,6 +373,12 @@ static void gen_fill_payload(uint8_t *payload, size_t payload_bytes, struct gen_
             st->phi += st->omega;
             if (st->phi >= 2 * M_PI)
                 st->phi -= 2 * M_PI;
+        } else if (strcmp(st->signal_type, "multitone") == 0) {
+            struct multitone_state *mt = st->multitone;
+            I = mt->table_i[mt->index] * st->amplitude;
+            Q = mt->table_q[mt->index] * st->amplitude;
+            if (++mt->index >= mt->len)
+                mt->index = 0;
         } else if (strcmp(st->signal_type, "ofdm") == 0) {
             ofdm_next_sample(st->ofdm, &I, &Q);
             I *= st->amplitude;
@@ -297,6 +411,8 @@ static void gen_fill_payload(uint8_t *payload, size_t payload_bytes, struct gen_
             ((int8_t *)payload)[4 * j + 2] = I_int;
             ((int8_t *)payload)[4 * j + 3] = Q_int;
         } else {
+            if (I > 1.0f) I = 1.0f; else if (I < -1.0f) I = -1.0f;
+            if (Q > 1.0f) Q = 1.0f; else if (Q < -1.0f) Q = -1.0f;
             int16_t I_int = (int16_t)(I * 2047);
             int16_t Q_int = (int16_t)(Q * 2047);
             uint16_t gpio1 = 0, gpio2 = 0;
@@ -325,7 +441,7 @@ static void gen_fill_payload(uint8_t *payload, size_t payload_bytes, struct gen_
 /* Signal (DMA TX) with GPIO PPS */
 /*-----------------------------*/
 
-static void m2sdr_gen(const char *device_id, double sample_rate, double frequency, double amplitude, uint8_t zero_copy, double pps_freq, uint8_t gpio_pin, const char *signal_type, uint8_t enable_header, uint8_t use_8bit, int ofdm_fft_size, int ofdm_cp_len, int ofdm_occupied_carriers, const char *ofdm_modulation, uint32_t ofdm_seed) {
+static void m2sdr_gen(const char *device_id, double sample_rate, double frequency, double amplitude, uint8_t zero_copy, double pps_freq, uint8_t gpio_pin, const char *signal_type, uint8_t enable_header, uint8_t use_8bit, int ofdm_fft_size, int ofdm_cp_len, int ofdm_occupied_carriers, const char *ofdm_modulation, uint32_t ofdm_seed, struct multitone_state *multitone) {
     static struct litepcie_dma_ctrl dma = {.use_reader = 1};
 
     int i = 0;
@@ -452,6 +568,8 @@ static void m2sdr_gen(const char *device_id, double sample_rate, double frequenc
         ofdm_init(&ofdm, ofdm_fft_size, ofdm_cp_len, ofdm_occupied_carriers, ofdm_modulation, ofdm_seed);
         ofdm_inited = 1;
     }
+    if (strcmp(signal_type, "multitone") == 0 && multitone_init(multitone, sample_rate) != 0)
+        goto cleanup;
 
     /* Tone generation parameters */
     srand(time(NULL));
@@ -467,6 +585,7 @@ static void m2sdr_gen(const char *device_id, double sample_rate, double frequenc
     gen.use_8bit = use_8bit;
     gen.lfsr = (uint32_t)rand() | 1u;
     gen.ofdm = &ofdm;
+    gen.multitone = multitone;
 
     /* Test Loop */
     last_time = get_time_ms();
@@ -572,6 +691,7 @@ cleanup:
         (void)m2sdr_stream_release(dev, M2SDR_TX);
     if (ofdm_inited)
         ofdm_cleanup(&ofdm);
+    multitone_cleanup(multitone);
 #ifdef CSR_GPIO_BASE
     if (dev)
         (void)m2sdr_reg_write(dev, CSR_GPIO_CONTROL_ADDR, 0);
@@ -596,8 +716,11 @@ static void help(void) {
            "  -i, --ip ADDR                  Target IP address for Etherbone.\n"
            "      --port PORT                Port number (default: 1234).\n"
            "      --sample-rate HZ           Set sample rate in Hz (default: 30720000).\n"
-           "      --signal TYPE              Set signal type: tone, white, prbs, or ofdm.\n"
+           "      --signal TYPE              Set signal type: tone, multitone, white, prbs, or ofdm.\n"
            "      --tone-freq HZ             Set tone frequency in Hz (default: 1000).\n"
+           "      --tones F[:A],F[:A],...    Multitone frequencies in Hz with optional amplitudes\n"
+           "                                 (default 1.0, scaled by --amplitude). Each tone is snapped\n"
+           "                                 to an exactly periodic table (no phase jump per buffer).\n"
            "      --ofdm-fft-size N          OFDM FFT size (default: 1024).\n"
            "      --ofdm-cp-len N            OFDM cyclic prefix length (default: 32).\n"
            "      --ofdm-carriers N          OFDM occupied carriers (default: 200).\n"
@@ -634,6 +757,8 @@ int main(int argc, char **argv) {
     uint32_t ofdm_seed = 1;
     char signal_type[16] = "tone"; /* Default to tone */
     char ofdm_modulation[16] = "qpsk";
+    static struct multitone_state multitone;
+    int have_tones = 0;
     struct m2sdr_cli_device cli_dev;
     static struct option options[] = {
         { "help", no_argument, NULL, 'h' },
@@ -656,6 +781,7 @@ int main(int argc, char **argv) {
         { "ofdm-seed", required_argument, NULL, 7 },
         { "format", required_argument, NULL, 1 },
         { "8bit", no_argument, NULL, 2 },
+        { "tones", required_argument, NULL, 9 },
         { NULL, 0, NULL, 0 }
     };
 
@@ -686,8 +812,8 @@ int main(int argc, char **argv) {
         case 't':
             strncpy(signal_type, optarg, sizeof(signal_type) - 1);
             signal_type[sizeof(signal_type) - 1] = '\0';
-            if (strcmp(signal_type, "tone") != 0 && strcmp(signal_type, "white") != 0 && strcmp(signal_type, "prbs") != 0 && strcmp(signal_type, "ofdm") != 0) {
-                m2sdr_cli_invalid_choice("signal", signal_type, "tone, white, prbs, or ofdm");
+            if (strcmp(signal_type, "tone") != 0 && strcmp(signal_type, "multitone") != 0 && strcmp(signal_type, "white") != 0 && strcmp(signal_type, "prbs") != 0 && strcmp(signal_type, "ofdm") != 0) {
+                m2sdr_cli_invalid_choice("signal", signal_type, "tone, multitone, white, prbs, or ofdm");
                 exit(1);
             }
             break;
@@ -776,6 +902,14 @@ int main(int argc, char **argv) {
             if (m2sdr_cli_handle_device_option(&cli_dev, 'p', optarg) != 0)
                 exit(1);
             break;
+        case 9:
+            if (multitone_parse(&multitone, optarg) != 0) {
+                m2sdr_cli_error("invalid tone list '%s' (expected F[:A],F[:A],..., up to %d tones)",
+                                optarg, MULTITONE_MAX_TONES);
+                return 1;
+            }
+            have_tones = 1;
+            break;
         default:
             exit(1);
         }
@@ -790,6 +924,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (strcmp(signal_type, "multitone") == 0 && !have_tones) {
+        fprintf(stderr, "--signal multitone requires --tones\n");
+        return 1;
+    }
+
     /* Show help only if no options are provided */
     if (argc == 1) {
         help();
@@ -799,7 +938,7 @@ int main(int argc, char **argv) {
         return 1;
 
     /* Generate and play tone with optional PPS */
-    m2sdr_gen(m2sdr_cli_device_id(&cli_dev), sample_rate, frequency, amplitude, m2sdr_device_zero_copy, pps_freq, gpio_pin, signal_type, enable_header, use_8bit, ofdm_fft_size, ofdm_cp_len, ofdm_occupied_carriers, ofdm_modulation, ofdm_seed);
+    m2sdr_gen(m2sdr_cli_device_id(&cli_dev), sample_rate, frequency, amplitude, m2sdr_device_zero_copy, pps_freq, gpio_pin, signal_type, enable_header, use_8bit, ofdm_fft_size, ofdm_cp_len, ofdm_occupied_carriers, ofdm_modulation, ofdm_seed, &multitone);
 
     return 0;
 }

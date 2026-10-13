@@ -1891,6 +1891,77 @@ static void m2sdr_reset_keep_error(int rc, int *status)
 
 /* Drive the FPGA-connected AD9361 EN_AGC pin without disturbing the other
  * AD9361 config bits in the same CSR. */
+#if defined(CSR_SYNC_CLK_OUT_CONTROL_ADDR) && defined(CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_OFFSET)
+static int m2sdr_check_sync_clk_out(struct m2sdr_dev *dev)
+{
+    uint32_t features;
+    int rc;
+
+    rc = m2sdr_reg_read(dev, CSR_CAPABILITY_FEATURES_ADDR, &features);
+    if (rc != M2SDR_ERR_OK)
+        return rc;
+    if (((features >> CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_OFFSET) & 1u) == 0)
+        return M2SDR_ERR_UNSUPPORTED;
+    return M2SDR_ERR_OK;
+}
+#endif
+
+int m2sdr_set_sync_clk_out(struct m2sdr_dev *dev, bool enable)
+{
+#if defined(CSR_SYNC_CLK_OUT_CONTROL_ADDR) && defined(CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_OFFSET)
+    uint32_t value;
+    int rc;
+
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+
+    rc = m2sdr_check_sync_clk_out(dev);
+    if (rc != M2SDR_ERR_OK)
+        return rc;
+
+    rc = m2sdr_reg_read(dev, CSR_SYNC_CLK_OUT_CONTROL_ADDR, &value);
+    if (rc != M2SDR_ERR_OK)
+        return rc;
+
+    if (enable)
+        value |= (1u << CSR_SYNC_CLK_OUT_CONTROL_OE_OFFSET);
+    else
+        value &= ~(1u << CSR_SYNC_CLK_OUT_CONTROL_OE_OFFSET);
+
+    return m2sdr_reg_write(dev, CSR_SYNC_CLK_OUT_CONTROL_ADDR, value);
+#else
+    (void)dev;
+    (void)enable;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_get_sync_clk_out(struct m2sdr_dev *dev, bool *enabled)
+{
+#if defined(CSR_SYNC_CLK_OUT_CONTROL_ADDR) && defined(CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_OFFSET)
+    uint32_t value;
+    int rc;
+
+    if (!dev || !enabled)
+        return M2SDR_ERR_INVAL;
+
+    rc = m2sdr_check_sync_clk_out(dev);
+    if (rc != M2SDR_ERR_OK)
+        return rc;
+
+    rc = m2sdr_reg_read(dev, CSR_SYNC_CLK_OUT_CONTROL_ADDR, &value);
+    if (rc != M2SDR_ERR_OK)
+        return rc;
+
+    *enabled = ((value >> CSR_SYNC_CLK_OUT_CONTROL_OE_OFFSET) & 1u) != 0;
+    return M2SDR_ERR_OK;
+#else
+    (void)dev;
+    (void)enabled;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
 int m2sdr_set_agc_pin(struct m2sdr_dev *dev, bool enable)
 {
 #if defined(CSR_AD9361_CONFIG_ADDR) && defined(CSR_AD9361_CONFIG_EN_AGC_OFFSET)
