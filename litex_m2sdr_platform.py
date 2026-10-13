@@ -264,4 +264,4 @@ class Platform(Xilinx7SeriesPlatform):
         self.add_period_constraint(self.lookup_request("si5351_clk0",          0, loose=True), 1e9/38.4e6)         # Local VCTCXO.
         self.add_period_constraint(self.lookup_request("si5351_clk1",          0, loose=True), 1e9/100e6)          # Time/PPS reference.
         self.add_period_constraint(self.lookup_request("ad9361_rfic:rx_clk_p", 0, loose=True), 1e9/self.rfic_clk_freq) # RF sample clock.
-        self.add_period_constraint(self.lookup_request("sync_clk_in",          0, loose=True), 1e9/10e6)           # External sync/debug clock.
+        self.add_period_constraint(self.lookup_request("sync_clk_in",          0, loose=True), 1e9/getattr(self, "sync_ref_freq", 10e6)) # External sync/debug clock (shared reference).

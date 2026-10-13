@@ -492,12 +492,40 @@ static int m2sdr_stream_to_ad9361_sample_rate(int64_t stream_rate,
 }
 
 #ifdef CSR_SI5351_BASE
-/* Select the precomputed SI5351 register table for a reference topology. */
-static void m2sdr_si5351_select_config(enum m2sdr_clock_source clock_source,
-                                       int64_t refclk_freq,
-                                       const uint8_t (**config)[2],
-                                       size_t *length)
+/* Frequency of the shared reference on CN6 / SI5351C CLKIN, as built into the gateware
+ * (--sync-ref-freq). Gateware without the register reads 0: the historical 10MHz. */
+static int64_t m2sdr_sync_ref_freq(struct m2sdr_dev *dev)
 {
+#ifdef CSR_SYNC_CLK_OUT_REF_FREQ_ADDR
+    uint32_t freq = 0;
+
+    if (m2sdr_reg_read(dev, CSR_SYNC_CLK_OUT_REF_FREQ_ADDR, &freq) == 0 &&
+        freq != 0 && freq != 0xffffffffu)
+        return freq;
+#else
+    (void)dev;
+#endif
+    return 10000000;
+}
+
+/* Select the precomputed SI5351 register table for a reference topology. */
+static int m2sdr_si5351_select_config(enum m2sdr_clock_source clock_source,
+                                      int64_t refclk_freq,
+                                      int64_t clkin_freq,
+                                      const uint8_t (**config)[2],
+                                      size_t *length)
+{
+    if (clock_source != M2SDR_CLOCK_SOURCE_INTERNAL && clkin_freq == 38400000) {
+        /* Integer-N table; only the 38.4MHz AD9361 reference is provided. */
+        if (refclk_freq != 38400000)
+            return M2SDR_ERR_UNSUPPORTED;
+        *config = si5351_clkin_38p4m_38p4m_config;
+        *length = sizeof(si5351_clkin_38p4m_38p4m_config) / sizeof(si5351_clkin_38p4m_38p4m_config[0]);
+        return M2SDR_ERR_OK;
+    }
+    if (clock_source != M2SDR_CLOCK_SOURCE_INTERNAL && clkin_freq != 10000000)
+        return M2SDR_ERR_UNSUPPORTED;
+
     if (clock_source == M2SDR_CLOCK_SOURCE_INTERNAL) {
         if (refclk_freq == 40000000) {
             *config = si5351_xo_40m_config;
@@ -515,6 +543,7 @@ static void m2sdr_si5351_select_config(enum m2sdr_clock_source clock_source,
             *length = sizeof(si5351_clkin_10m_38p4m_config) / sizeof(si5351_clkin_10m_38p4m_config[0]);
         }
     }
+    return M2SDR_ERR_OK;
 }
 
 static int m2sdr_wait_si5351_ready(struct m2sdr_dev *dev, void *conn)
@@ -555,6 +584,8 @@ static int m2sdr_configure_clocking(struct m2sdr_dev *dev,
 #ifdef CSR_SI5351_BASE
     const uint8_t (*si5351_config)[2];
     size_t si5351_length;
+    int64_t clkin_freq = m2sdr_sync_ref_freq(dev);
+    int rc;
 
     M2SDR_LOGF("Initializing SI5351 Clocking...\n");
 
@@ -564,13 +595,13 @@ static int m2sdr_configure_clocking(struct m2sdr_dev *dev,
             SI5351B_VERSION * (1 << CSR_SI5351_CONTROL_VERSION_OFFSET)) != 0)
             return M2SDR_ERR_IO;
     } else if (clock_source == M2SDR_CLOCK_SOURCE_EXTERNAL) {
-        M2SDR_LOGF("Using external 10MHz from uFL as SI5351C CLKIN source...\n");
+        M2SDR_LOGF("Using external %.1fMHz from uFL/CN6 as SI5351C CLKIN source...\n", clkin_freq / 1e6);
         if (m2sdr_reg_write(dev, CSR_SI5351_CONTROL_ADDR,
               SI5351C_VERSION               * (1 << CSR_SI5351_CONTROL_VERSION_OFFSET) |
               SI5351C_10MHZ_CLK_IN_FROM_UFL * (1 << CSR_SI5351_CONTROL_CLKIN_SRC_OFFSET)) != 0)
             return M2SDR_ERR_IO;
     } else if (clock_source == M2SDR_CLOCK_SOURCE_SI5351C_FPGA) {
-        M2SDR_LOGF("Using FPGA 10MHz as SI5351C CLKIN source...\n");
+        M2SDR_LOGF("Using FPGA %.1fMHz as SI5351C CLKIN source...\n", clkin_freq / 1e6);
         if (m2sdr_reg_write(dev, CSR_SI5351_CONTROL_ADDR,
               SI5351C_VERSION                * (1 << CSR_SI5351_CONTROL_VERSION_OFFSET) |
               SI5351C_10MHZ_CLK_IN_FROM_PLL * (1 << CSR_SI5351_CONTROL_CLKIN_SRC_OFFSET)) != 0)
@@ -580,8 +611,13 @@ static int m2sdr_configure_clocking(struct m2sdr_dev *dev,
     /* The table selection is driven only by the clock source and requested
      * AD9361 refclk. The SI5351 profile itself encodes the rest of the clock
      * tree. */
-    m2sdr_si5351_select_config(clock_source, cfg->refclk_freq,
-                               &si5351_config, &si5351_length);
+    rc = m2sdr_si5351_select_config(clock_source, cfg->refclk_freq, clkin_freq,
+                                    &si5351_config, &si5351_length);
+    if (rc != M2SDR_ERR_OK) {
+        M2SDR_LOGF("No SI5351 table for a %.1fMHz CLKIN and a %.1fMHz AD9361 reference.\n",
+                   clkin_freq / 1e6, cfg->refclk_freq / 1e6);
+        return rc;
+    }
     if (!m2sdr_si5351_i2c_config_checked(conn, SI5351_I2C_ADDR,
         si5351_config, si5351_length))
         return m2sdr_transport_error(dev);
@@ -2403,9 +2439,10 @@ int m2sdr_set_refclk_ppm(struct m2sdr_dev *dev, double ppm)
     if (!m2sdr_si5351_i2c_check_litei2c(conn))
         return M2SDR_ERR_UNSUPPORTED;
 
-    m2sdr_si5351_select_config(dev->rf_last_config.clock_source,
-                               dev->rf_last_config.refclk_freq,
-                               &si5351_config, &si5351_length);
+    if (m2sdr_si5351_select_config(dev->rf_last_config.clock_source,
+                                   dev->rf_last_config.refclk_freq, m2sdr_sync_ref_freq(dev),
+                                   &si5351_config, &si5351_length) != M2SDR_ERR_OK)
+        return M2SDR_ERR_UNSUPPORTED;
     if (!m2sdr_si5351_i2c_trim_pllb_ppm(conn, SI5351_I2C_ADDR,
         si5351_config, si5351_length, ppm, &dev->si5351_pllb, &report))
         return m2sdr_transport_error(dev);
@@ -2447,9 +2484,10 @@ int m2sdr_get_refclk_ppm_window(struct m2sdr_dev *dev, double *ppm_min, double *
     if (!dev->rf_last_config_valid)
         return M2SDR_ERR_STATE;
 
-    m2sdr_si5351_select_config(dev->rf_last_config.clock_source,
-                               dev->rf_last_config.refclk_freq,
-                               &si5351_config, &si5351_length);
+    if (m2sdr_si5351_select_config(dev->rf_last_config.clock_source,
+                                   dev->rf_last_config.refclk_freq, m2sdr_sync_ref_freq(dev),
+                                   &si5351_config, &si5351_length) != M2SDR_ERR_OK)
+        return M2SDR_ERR_UNSUPPORTED;
     if (!m2sdr_si5351_pllb_trim_window(si5351_config, si5351_length,
                                        ppm_min, ppm_max))
         return M2SDR_ERR_IO;
