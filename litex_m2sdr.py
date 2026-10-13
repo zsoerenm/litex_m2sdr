@@ -182,10 +182,12 @@ class CRG(LiteXModule):
         # Clk / Rst.
         # ----------
         clk100 = platform.request("clk100")
-        clk_rst = Signal()
+        clk_rst  = Signal()
+        pll_rst  = self.rst
         if sync_slave:
             clk100 = self.add_sync_slave_ref(clk100)
             clk_rst = self.ref_switch_rst
+            pll_rst = self.soc_rst_local
             # Second input of the PLL/MMCM: the CN6-derived 100MHz, selected by ref_sel_cn6.
             ref_inputs = dict(
                 p_CLKIN2_PERIOD = 10.0,
@@ -196,7 +198,7 @@ class CRG(LiteXModule):
         # PLL.
         # ----
         self.pll = pll = S7PLL(speedgrade=-3)
-        self.comb += self.pll.reset.eq(self.rst | clk_rst)
+        self.comb += self.pll.reset.eq(pll_rst | clk_rst)
         pll.register_clkin(clk100, 100e6)
         if sync_slave:
             pll.params.update(ref_inputs)
@@ -204,7 +206,7 @@ class CRG(LiteXModule):
         if not with_white_rabbit:
             # Keep clk10 on a dedicated MMCM so the SI5351C FPGA CLKIN path can be phase-steered later.
             self.clk10_mmcm = clk10_mmcm = S7MMCM(speedgrade=-3, fractional=False)
-            self.comb += clk10_mmcm.reset.eq(self.rst | clk_rst)
+            self.comb += clk10_mmcm.reset.eq(pll_rst | clk_rst)
             clk10_mmcm.register_clkin(clk100, 100e6)
             if sync_slave:
                 clk10_mmcm.params.update(ref_inputs)
@@ -281,8 +283,9 @@ class CRG(LiteXModule):
         Returns the local oscillator (BUFG output) for CLKIN1: with clock switching, CLKIN1 and
         CLKIN2 must come from the same buffer type (DRC REQP-119).
         """
-        self.cn6_in          = Signal()
+        self.cn6_in          = Signal(attr={("dont_touch", "true")})
         self.ref_switch_rst  = Signal()
+        self.soc_rst_local   = Signal()
         self.ref_sel_cn6     = Signal()
         self.cd_clk100_local = ClockDomain(reset_less=True)
         self.cd_cn6_100      = ClockDomain(reset_less=True)
@@ -324,6 +327,23 @@ class CRG(LiteXModule):
                 rst_cnt.eq(rst_cnt - 1),
             ),
             self.ref_switch_rst.eq(rst_cnt != 0),
+        ]
+
+        # SoC reset requests (self.rst, a one-cycle pulse from the sys-domain CSR) become a
+        # fixed-length PLL/MMCM reset generated here: driven directly, the pulse could stop its
+        # own clock and never deassert, leaving the sys domain dead.
+        rst_req   = Signal()
+        rst_req_d = Signal()
+        soc_cnt   = Signal(13)
+        self.specials += MultiReg(self.rst, rst_req, odomain="clk100_local")
+        self.sync.clk100_local += [
+            rst_req_d.eq(rst_req),
+            If(rst_req & ~rst_req_d,
+                soc_cnt.eq(2**13 - 1),
+            ).Elif(soc_cnt != 0,
+                soc_cnt.eq(soc_cnt - 1),
+            ),
+            self.soc_rst_local.eq(soc_cnt != 0),
         ]
         return self.cd_clk100_local.clk
 
@@ -588,6 +608,10 @@ class BaseSoC(SoCMini):
         if with_sync_slave:
             # FPGA clocks follow the 10MHz received on CN6 (clock-slave boards only, see CRG).
             self.comb += self.crg.cn6_in.eq(self.sync_clk_out.i)
+            # Keep the IOBUF output net: otherwise synthesis may connect cn6_bufg to the port and
+            # infer a second input buffer (DRC MDRV-1, multiple drivers on sync_clk_in).
+            self.sync_clk_out.i.attr.add(("dont_touch", "true"))
+            platform.add_platform_command("set_property IO_BUFFER_TYPE NONE [get_ports sync_clk_in]")
             platform.add_platform_command(
                 "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins -hierarchical -filter {{NAME =~ *cn6_bufg/I}}]]")
             # Every PLL/MMCM output exists twice (local oscillator / CN6 reference), never both at once.
