@@ -1825,13 +1825,20 @@ int m2sdr_set_time(struct m2sdr_dev *dev, uint64_t time_ns)
     if (ptp_owned)
         return M2SDR_ERR_STATE;
 
+    /* Preserve the other control bits: a cleared ENABLE holds the time generator at 0. */
+    uint32_t ctrl = 0;
+    if (m2sdr_reg_read(dev, CSR_TIME_GEN_CONTROL_ADDR, &ctrl) != 0)
+        return M2SDR_ERR_IO;
+    ctrl |=  (1u << CSR_TIME_GEN_CONTROL_ENABLE_OFFSET);
+    ctrl &= ~((1u << CSR_TIME_GEN_CONTROL_READ_OFFSET) | (1u << CSR_TIME_GEN_CONTROL_WRITE_OFFSET));
+
     if (m2sdr_reg_write(dev, CSR_TIME_GEN_WRITE_TIME_ADDR + 0, (uint32_t)(time_ns >> 32)) != 0)
         return M2SDR_ERR_IO;
     if (m2sdr_reg_write(dev, CSR_TIME_GEN_WRITE_TIME_ADDR + 4, (uint32_t)(time_ns & 0xffffffffu)) != 0)
         return M2SDR_ERR_IO;
-    if (m2sdr_reg_write(dev, CSR_TIME_GEN_CONTROL_ADDR, (1 << CSR_TIME_GEN_CONTROL_WRITE_OFFSET)) != 0)
+    if (m2sdr_reg_write(dev, CSR_TIME_GEN_CONTROL_ADDR, ctrl | (1u << CSR_TIME_GEN_CONTROL_WRITE_OFFSET)) != 0)
         return M2SDR_ERR_IO;
-    if (m2sdr_reg_write(dev, CSR_TIME_GEN_CONTROL_ADDR, 0) != 0)
+    if (m2sdr_reg_write(dev, CSR_TIME_GEN_CONTROL_ADDR, ctrl) != 0)
         return M2SDR_ERR_IO;
     return M2SDR_ERR_OK;
 }
