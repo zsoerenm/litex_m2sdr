@@ -31,8 +31,8 @@ _io = [
     # Debug.
     ("debug", 0, Pins("V13"), IOStandard("LVCMOS33")), # SYNCDBG_CLK.
 
-    # Ext Sync/ClkIn..
-    ("sync_clk_in", 0, Pins("V13"), IOStandard("LVCMOS33")), # SYNCDBG_CLK.
+    # Ext Sync/ClkIn.. (Bidirectional: 10MHz ClkIn to SI5351, or switchable 10MHz ClkOut, see SyncClkOut).
+    ("sync_clk_in", 0, Pins("V13"), IOStandard("LVCMOS33"), Misc("SLEW=SLOW"), Misc("DRIVE=8")), # SYNCDBG_CLK.
     ("pps_in", 0, Pins("M2:NC22"), IOStandard("LVCMOS33")), # M.2 pin 22 / PPS_IN.
 
     # SI5351 Clocking.

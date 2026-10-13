@@ -253,6 +253,53 @@ class CRG(LiteXModule):
             self.dmtd_mmcm.expose_dps("clk200", with_csr=False)
             self.dmtd_mmcm.params.update(p_CLKOUT0_USE_FINE_PS="TRUE")
 
+# SyncClkOut ---------------------------------------------------------------------------------------
+
+class SyncClkOut(LiteXModule):
+    """Bidirectional SYNCDBG_CLK (CN6) pad.
+
+    The input path always feeds the SI5351 ClkIn mux (uFL/external source). When oe is set, the
+    pad also forwards clk10 (the FPGA 10MHz reference fed to the SI5351C in fpga mode) through an
+    ODDR so a second board can lock to it with --sync external. oe resets to 0: after power-on the
+    pad is never driven until software explicitly enables it on the clock master.
+    """
+    def __init__(self, pad):
+        self.i = Signal()
+
+        self.control = CSRStorage(fields=[
+            CSRField("oe", size=1, offset=0, reset=0, values=[
+                ("``0b0``", "Pad is an input (ClkIn only)."),
+                ("``0b1``", "Pad drives clk10 (10MHz ClkOut)."),
+            ]),
+        ])
+
+        # # #
+
+        # Resynchronize Output Enable to clk10 (resets to 0 with clk10).
+        oe = Signal()
+        self.specials += MultiReg(self.control.fields.oe, oe, odomain="clk10")
+
+        # Forward clk10 through an ODDR.
+        o = Signal()
+        self.specials += Instance("ODDR",
+            p_DDR_CLK_EDGE = "SAME_EDGE",
+            i_C  = ClockSignal("clk10"),
+            i_CE = 1,
+            i_S  = 0,
+            i_R  = 0,
+            i_D1 = 1,
+            i_D2 = 0,
+            o_Q  = o,
+        )
+
+        # Bidirectional Buffer.
+        self.specials += Instance("IOBUF",
+            i_I   = o,
+            i_T   = ~oe,
+            o_O   = self.i,
+            io_IO = pad,
+        )
+
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCMini):
@@ -309,6 +356,7 @@ class BaseSoC(SoCMini):
         "ad9361"           : 24,
         "crossbar"         : 25,
         "txrx_loopback"    : 33,
+        "sync_clk_out"     : 43,
 
         # Measurements/Analyzer.
         "clk_measurement"  : 30,
@@ -441,6 +489,9 @@ class BaseSoC(SoCMini):
             # RFIC.
             rfic_oversampling = with_rfic_oversampling,
 
+            # Clocking.
+            sync_clk_out    = True,
+
             # Board.
             variant        = variant,
             jtagbone       = with_jtagbone,
@@ -456,8 +507,9 @@ class BaseSoC(SoCMini):
         self.si5351 = SI5351(pads=si5351_pads, i2c_base=si5351_i2c_base)
         self.bus.add_master(name="si5351", master=self.si5351.sequencer.bus)
 
-        # SI5351 ClkIn Ext/uFL.
-        self.comb += self.si5351.clkin_ufl.eq(platform.request("sync_clk_in"))
+        # SI5351 ClkIn Ext/uFL + switchable 10MHz ClkOut on the same pin (SYNCDBG_CLK/CN6).
+        self.sync_clk_out = SyncClkOut(pad=platform.request("sync_clk_in"))
+        self.comb += self.si5351.clkin_ufl.eq(self.sync_clk_out.i)
 
         # SI5351 ClkIn/Out.
         si5351_clk0   = platform.request("si5351_clk0")
@@ -1209,7 +1261,7 @@ class BaseSoC(SoCMini):
             "ad9361_rfic_ctrl* ad9361_rfic_en_agc ad9361_rfic_enable ad9361_rfic_rst_n ad9361_rfic_txnrx "
             "ad9361_spi_clk ad9361_spi_cs_n ad9361_spi_mosi "
             "flash_cs_n flash_mosi "
-            "si5351_scl si5351_sda si5351_pwm"
+            "si5351_scl si5351_sda si5351_pwm sync_clk_in"
             "}}]"
         )
 
