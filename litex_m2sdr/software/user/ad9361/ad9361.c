@@ -1775,7 +1775,7 @@ static int32_t ad9361_rfpll_vco_init(struct ad9361_rf_phy *phy,
 	struct spi_device *spi = phy->spi;
 	const struct SynthLUT(*tab);
 	int32_t i = 0;
-	uint32_t range, offs = 0;
+	uint32_t range, offs = 0, cp_ua, cp;
 
 	range = ad9361_rfvco_tableindex(ref_clk);
 
@@ -1832,8 +1832,12 @@ static int32_t ad9361_rfpll_vco_init(struct ad9361_rf_phy *phy,
 			 VCO_VARACTOR_OFFSET(0) |
 			 VCO_VARACTOR_REFERENCE_TCF(7));
 
-	ad9361_spi_writef(spi, REG_RX_CP_CURRENT + offs, CHARGE_PUMP_CURRENT(~0),
-			  tab[i].Charge_Pump_Current);
+	/* Charge pump current: LUT value unless overridden (Icp = 100 uA x (code + 1)) */
+	cp_ua = tx ? phy->pdata->tx_rfpll_cp_current_ua : phy->pdata->rx_rfpll_cp_current_ua;
+	cp = tab[i].Charge_Pump_Current;
+	if (cp_ua)
+		cp = clamp_t(uint32_t, DIV_ROUND_CLOSEST(cp_ua, 100), 1, 64) - 1;
+	ad9361_spi_writef(spi, REG_RX_CP_CURRENT + offs, CHARGE_PUMP_CURRENT(~0), cp);
 	ad9361_spi_write(spi, REG_RX_LOOP_FILTER_1 + offs,
 			 LOOP_FILTER_C2(tab[i].LF_C2) |
 			 LOOP_FILTER_C1(tab[i].LF_C1));

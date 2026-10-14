@@ -636,6 +636,11 @@ struct m2sdr_config {
     /* Legacy string overrides kept for compatibility with old utilities. */
     const char *chan_mode; /* legacy string override: "2t2r" or "1t1r" */
     const char *sync_mode; /* legacy string override: "internal", "external", or "fpga" */
+    /* AD9361 RF PLL (RX and TX synthesizer) charge pump current in uA, 100 to 6400 in 100 uA
+     * steps; 0 keeps the ADI synthesizer LUT value (4500 uA at 6-12 GHz VCO). Lower currents
+     * narrow the RF PLL loop: less reference-borne noise and spurs reach the LO, more VCO noise.
+     * Boards sharing a reference must use the same value so that its noise stays common. */
+    int32_t rfpll_cp_current_ua;
 };
 
 struct m2sdr_dev;

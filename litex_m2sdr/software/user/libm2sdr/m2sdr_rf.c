@@ -316,6 +316,8 @@ static int m2sdr_validate_config_values(const struct m2sdr_config *cfg)
     if (!(cfg->refclk_ppm >= -M2SDR_REFCLK_PPM_MAX &&
           cfg->refclk_ppm <=  M2SDR_REFCLK_PPM_MAX))
         return M2SDR_ERR_RANGE;
+    if (cfg->rfpll_cp_current_ua < 0 || cfg->rfpll_cp_current_ua > 6400)
+        return M2SDR_ERR_RANGE;
     if (cfg->tx_freq <= 0 || cfg->rx_freq <= 0)
         return M2SDR_ERR_RANGE;
     if (cfg->tx_att < M2SDR_TX_ATT_MIN_DB || cfg->tx_att > M2SDR_TX_ATT_MAX_DB)
@@ -1965,7 +1967,8 @@ static bool m2sdr_configs_equal(const struct m2sdr_config *a,
            a->enable_8bit_mode == b->enable_8bit_mode &&
            a->sample_format == b->sample_format &&
            a->channel_layout == b->channel_layout &&
-           a->clock_source == b->clock_source;
+           a->clock_source == b->clock_source &&
+           a->rfpll_cp_current_ua == b->rfpll_cp_current_ua;
 }
 
 static void m2sdr_store_applied_config(struct m2sdr_dev *dev,
@@ -2192,6 +2195,8 @@ int m2sdr_apply_config(struct m2sdr_dev *dev, const struct m2sdr_config *cfg)
     init_param->tx_synthesizer_frequency_hz = cfg->tx_freq;
     init_param->rf_rx_bandwidth_hz          = (uint32_t)cfg->bandwidth;
     init_param->rf_tx_bandwidth_hz          = (uint32_t)cfg->bandwidth;
+    init_param->rx_rfpll_cp_current_ua      = (uint32_t)cfg->rfpll_cp_current_ua;
+    init_param->tx_rfpll_cp_current_ua      = (uint32_t)cfg->rfpll_cp_current_ua;
 
     {
         /* M2SDR_RF_CHANNEL=2 selects the second physical RF port pair

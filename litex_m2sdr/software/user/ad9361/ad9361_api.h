@@ -288,6 +288,10 @@ typedef struct {
 			uint32_t rate);
 	int32_t		(*ad9361_rfpll_ext_set_rate)(struct refclk_scale *clk_priv,
 			uint32_t rate);
+	/* RF PLL charge pump current override in uA (100 to 6400, 100 uA steps), applied on every
+	 * VCO init; 0 keeps the synthesizer LUT value. Lower currents narrow the loop bandwidth. */
+	uint32_t	rx_rfpll_cp_current_ua;
+	uint32_t	tx_rfpll_cp_current_ua;
 } AD9361_InitParam;
 
 typedef struct {

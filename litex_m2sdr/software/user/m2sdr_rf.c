@@ -62,7 +62,9 @@ static void help(void)
            "      --bist-rx-tone     Run RX tone test.\n"
            "      --bist-prbs        Run PRBS test.\n"
            "      --calibrate-delay  Scan and program FPGA <-> AD9361 RX/TX clock/data delays using PRBS.\n"
-           "      --bist-tone-freq HZ Set the BIST tone frequency in Hz (default: %d).\n",
+           "      --bist-tone-freq HZ Set the BIST tone frequency in Hz (default: %d).\n"
+           "      --rfpll-cp UA      RX/TX RF PLL charge pump current in uA, 100-6400 (default: 0,\n"
+           "                         ADI LUT, 4500). Lower values narrow the RF PLL loop.\n",
            DEFAULT_REFCLK_FREQ,
            DEFAULT_SAMPLERATE,
            DEFAULT_BANDWIDTH,
@@ -145,6 +147,8 @@ int main(int argc, char **argv)
         { "dig_tune_prbs", no_argument, NULL, 20 },
         { "bist-tone-freq", required_argument, NULL, 19 },
         { "bist_tone_freq", required_argument, NULL, 19 },
+        { "rfpll-cp", required_argument, NULL, 26 },
+        { "rfpll_cp", required_argument, NULL, 26 },
         { NULL, 0, NULL, 0 }
     };
     m2sdr_config_init(&cfg);
@@ -319,6 +323,17 @@ int main(int argc, char **argv)
             break;
         case 20:
             cfg.calibrate_interface_delay = true;
+            break;
+        case 26:
+            {
+                int cp_ua;
+
+                if (m2sdr_cli_parse_int_range(optarg, 0, 6400, &cp_ua) != 0) {
+                    m2sdr_cli_error("invalid RF PLL charge pump current '%s'", optarg);
+                    return 1;
+                }
+                cfg.rfpll_cp_current_ua = (int32_t)cp_ua;
+            }
             break;
         default:
             exit(1);
