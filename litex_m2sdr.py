@@ -52,6 +52,7 @@ from litex_m2sdr import Platform, _io_baseboard
 from litex_m2sdr.gateware.capability       import Capability
 from litex_m2sdr.gateware.clock_discipline import MMCMPhaseDiscipline, PTPClock10Discipline
 from litex_m2sdr.gateware.si5351           import SI5351
+from litex_m2sdr.gateware.phase_detector   import SyncMarkerTx, PhaseDetector
 from litex_m2sdr.gateware.ad9361.core import AD9361RFIC
 from litex_m2sdr.gateware.qpll        import SharedQPLL
 from litex_m2sdr.gateware.time        import TimeGenerator, TimeNsToPS
@@ -360,7 +361,8 @@ class SyncClkOut(LiteXModule):
     ODDR so a second board can lock to it with --sync external. oe resets to 0: after power-on the
     pad is never driven until software explicitly enables it on the clock master.
     """
-    def __init__(self, pad, ref_freq=10e6):
+    def __init__(self, pad, ref_freq=10e6, ddr=None):
+        # ddr: (clk, d1, d2) for the output ODDR instead of (clk10, 1, 0), see SyncMarkerTx.
         self.i = Signal()
 
         self.control = CSRStorage(fields=[
@@ -380,14 +382,15 @@ class SyncClkOut(LiteXModule):
 
         # Forward clk10 through an ODDR.
         o = Signal()
+        ddr_clk, ddr_d1, ddr_d2 = ddr if ddr is not None else (ClockSignal("clk10"), 1, 0)
         self.specials += Instance("ODDR",
             p_DDR_CLK_EDGE = "SAME_EDGE",
-            i_C  = ClockSignal("clk10"),
+            i_C  = ddr_clk,
             i_CE = 1,
             i_S  = 0,
             i_R  = 0,
-            i_D1 = 1,
-            i_D2 = 0,
+            i_D1 = ddr_d1,
+            i_D2 = ddr_d2,
             o_Q  = o,
         )
 
@@ -456,6 +459,8 @@ class BaseSoC(SoCMini):
         "crossbar"         : 25,
         "txrx_loopback"    : 33,
         "sync_clk_out"     : 43,
+        "sync_marker_tx"   : 44,
+        "phase_detector"   : 45,
 
         # Measurements/Analyzer.
         "clk_measurement"  : 30,
@@ -481,6 +486,7 @@ class BaseSoC(SoCMini):
         with_rfic_oversampling = False,
         with_sync_slave        = False,
         sync_ref_freq          = 10e6,
+        with_phase_detector    = False,
     ):
         if pps_input in ("tp1", "tp2") and with_gpio:
             raise ValueError("PPS input on TP1/TP2 cannot be used with --with-gpio.")
@@ -605,21 +611,35 @@ class BaseSoC(SoCMini):
 
         # SI5351 Clock Generator -------------------------------------------------------------------
 
+        # CN6 Duty-Cycle Marker (Clock Master) ----------------------------------------------------
+
+        if with_phase_detector:
+            if sync_ref_freq != 38.4e6:
+                raise ValueError("The phase detector requires --sync-ref-freq 38.4e6.")
+            if not with_sync_slave:
+                # CN6 and the SI5351C FPGA ClkIn both from the 2x marker clock (same edges).
+                self.sync_marker_tx = SyncMarkerTx()
+
         # SI5351 Control.
         si5351_pads   = platform.request("si5351")
         si5351_i2c_base = self.get_csr_address("si5351")
-        self.si5351 = SI5351(pads=si5351_pads, i2c_base=si5351_i2c_base)
+        marker_tx = getattr(self, "sync_marker_tx", None)
+        self.si5351 = SI5351(pads=si5351_pads, i2c_base=si5351_i2c_base,
+            clkin_fpga_clk = None if marker_tx is None else ClockSignal("cn6x2"),
+            clkin_fpga_ph  = None if marker_tx is None else marker_tx.ph)
         self.bus.add_master(name="si5351", master=self.si5351.sequencer.bus)
 
         # SI5351 ClkIn Ext/uFL + switchable 10MHz ClkOut on the same pin (SYNCDBG_CLK/CN6).
-        self.sync_clk_out = SyncClkOut(pad=platform.request("sync_clk_in"), ref_freq=sync_ref_freq)
+        self.sync_clk_out = SyncClkOut(pad=platform.request("sync_clk_in"), ref_freq=sync_ref_freq,
+            ddr = None if marker_tx is None else (ClockSignal("cn6x2"), marker_tx.cn6_d1, marker_tx.cn6_d2))
+        if with_sync_slave or with_phase_detector:
+            # Keep the IOBUF output net: otherwise synthesis may connect cn6_bufg/pd_bufg to the port
+            # and infer a second input buffer (DRC MDRV-1, multiple drivers on sync_clk_in).
+            self.sync_clk_out.i.attr.add(("dont_touch", "true"))
+            platform.add_platform_command("set_property IO_BUFFER_TYPE NONE [get_ports sync_clk_in]")
         if with_sync_slave:
             # FPGA clocks follow the 10MHz received on CN6 (clock-slave boards only, see CRG).
             self.comb += self.crg.cn6_in.eq(self.sync_clk_out.i)
-            # Keep the IOBUF output net: otherwise synthesis may connect cn6_bufg to the port and
-            # infer a second input buffer (DRC MDRV-1, multiple drivers on sync_clk_in).
-            self.sync_clk_out.i.attr.add(("dont_touch", "true"))
-            platform.add_platform_command("set_property IO_BUFFER_TYPE NONE [get_ports sync_clk_in]")
             platform.add_platform_command(
                 "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins -hierarchical -filter {{NAME =~ *cn6_bufg/I}}]]")
             # Every PLL/MMCM output exists twice (local oscillator / CN6 reference), never both at once.
@@ -1023,6 +1043,23 @@ class BaseSoC(SoCMini):
             oversampling   = with_rfic_oversampling,
         )
         self.ad9361.add_prbs()
+
+        # Phase Detector (sub-sample alignment over CN6) --------------------------------------------
+
+        if with_phase_detector:
+            self.phase_detector = PhaseDetector(cn6=self.sync_clk_out.i, rx_count=self.ad9361.phy.rx_count)
+            platform.add_platform_command(
+                "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins -hierarchical -filter {{NAME =~ *pd_bufg/I}}]]")
+            pd = self.phase_detector
+            for clk in [pd.cd_pd_ref.clk, pd.cd_pd_det.clk, pd.cd_pd_ps.clk]:
+                platform.add_false_path_constraints(self.crg.cd_sys.clk, clk)
+            platform.add_false_path_constraints(self.ad9361.cd_rfic.clk, pd.cd_pd_ps.clk)
+            # pd_ref -> pd_ps only through MultiRegs; pd_det -> pd_ref is a timed synchronous path.
+            if marker_tx is not None:
+                platform.add_false_path_constraints(self.crg.cd_sys.clk, marker_tx.cd_cn6x2.clk)
+                # cn6x2 BUFG -> SI5351 ClkIn BUFGMUX cascade (as clk10 without the phase detector).
+                platform.add_platform_command(
+                    "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -hierarchical -quiet {{cn6x2_clk}}]")
         self.ad9361.add_agc()
 
         # TX/RX Header Extracter/Inserter ----------------------------------------------------------
@@ -1820,6 +1857,7 @@ def main():
     # RFIC parameters.
     parser.add_argument("--with-rfic-oversampling", action="store_true", help="Double the RFIC clock to enable the oversampling mode.")
     parser.add_argument("--sync-ref-freq",          default=10e6, type=float, help="Shared reference on CN6 / SI5351C CLKIN in Hz: 10e6 or 38.4e6 (integer-N SI5351C PLL).")
+    parser.add_argument("--with-phase-detector",    action="store_true", help="CN6 duty-cycle marker (master) and wire-based sub-sample phase detector (needs --sync-ref-freq 38.4e6).")
     parser.add_argument("--with-sync-slave",        action="store_true", help="Clock-slave board: run the FPGA clocks from the 10MHz on CN6 once present (do not use on the clock master).")
 
     # PCIe parameters.
@@ -1928,6 +1966,7 @@ def main():
         with_rfic_oversampling = args.with_rfic_oversampling,
         with_sync_slave        = args.with_sync_slave,
         sync_ref_freq          = args.sync_ref_freq,
+        with_phase_detector    = args.with_phase_detector,
 
         # PCIe.
         with_pcie     = args.with_pcie,
@@ -2031,6 +2070,8 @@ def main():
             r += "_sync_slave"
         if args.sync_ref_freq != 10e6:
             r += f"_ref{args.sync_ref_freq/1e6:g}m".replace(".", "p")
+        if args.with_phase_detector:
+            r += "_pd"
         if args.without_jtagbone:
             r += "_no_jtagbone"
         return r

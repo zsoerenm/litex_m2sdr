@@ -264,7 +264,9 @@ class LiteI2CSequencer(LiteXModule):
 # SI5351 -------------------------------------------------------------------------------------------
 
 class SI5351(LiteXModule):
-    def __init__(self, pads, i2c_base, with_csr=True):
+    def __init__(self, pads, i2c_base, with_csr=True, clkin_fpga_clk=None, clkin_fpga_ph=None):
+        # clkin_fpga_clk/clkin_fpga_ph: FPGA ClkIn from a 2x clock (default clk10) with ODDR data
+        # clkin_fpga_ph (high on every other cycle), see SyncMarkerTx.
         self.version   = Signal() # SI5351 Version (0=B, 1=C).
         self.ss_en     = Signal() # SI5351 Spread spectrum enable (versions A and B).
         self.clkin_src = Signal() # SI5351 ClkIn Source.
@@ -312,7 +314,7 @@ class SI5351(LiteXModule):
         si5351_clkin = Signal()
         self.specials += Instance("BUFGMUX",
             i_S  = self.clkin_src,
-            i_I0 = ClockSignal("clk10"),
+            i_I0 = ClockSignal("clk10") if clkin_fpga_clk is None else clkin_fpga_clk,
             i_I1 = self.clkin_ufl,
             o_O  = si5351_clkin,
         )
@@ -331,6 +333,10 @@ class SI5351(LiteXModule):
                 SI5351_C_VERSION : [
                     si5351_ddr_i1.eq(1),
                     si5351_ddr_i2.eq(0),
+                ] if clkin_fpga_ph is None else [
+                    # From uFL: (1, 0) at the reference rate; from the FPGA: (ph, ph) at 2x.
+                    si5351_ddr_i1.eq(self.clkin_src | clkin_fpga_ph),
+                    si5351_ddr_i2.eq(~self.clkin_src & clkin_fpga_ph),
                 ]
             })
         ]

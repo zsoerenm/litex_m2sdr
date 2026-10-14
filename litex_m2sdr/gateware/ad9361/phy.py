@@ -135,6 +135,7 @@ class AD9361PHY(LiteXModule):
         # Maintains a free-running counter, reset to 1 on RX_FRAME rising edge for synchronization.
         rx_count   = Signal(2)
         rx_frame_d = Signal()
+        self.rx_count = rx_count  # Frame phase (2R2T: rx_count[1] is a frame-rate square wave).
         self.sync.rfic += [
             rx_frame_d.eq(rx_frame),
             rx_count.eq(rx_count + 1),
