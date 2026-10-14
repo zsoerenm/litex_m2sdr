@@ -126,7 +126,7 @@ def _mmcm(name, clkin, psclk, psen, psincdec, psdone, rst, locked, outs):
     return specials
 
 class PhaseDetector(LiteXModule):
-    def __init__(self, cn6, rx_count):
+    def __init__(self, cn6, rx_count, cn6_bufg=None):
         self.cd_pd_ref = ClockDomain(reset_less=True)
         self.cd_pd_det = ClockDomain(reset_less=True)
         self.cd_pd_ps  = ClockDomain(reset_less=True)
@@ -152,15 +152,18 @@ class PhaseDetector(LiteXModule):
 
         # Clocking.
         # ---------
-        cn6_bufg = Signal()
-        self.specials += Instance("BUFG", name="pd_bufg", i_I=cn6, o_O=cn6_bufg)
+        # cn6_bufg: an existing BUFG on the pad (the sync slave's CRG has one). A third clock-buffer
+        # load on the pad makes Vivado insert a LUT in front of all of them, which puts several ns
+        # of general routing into the slave's SI5351 reference path (CN6 -> BUFGMUX -> ODDR); its
+        # delay is modulated by supply ripple: ~8 dB stronger ~1.35 MHz spurs on the slave.
+        if cn6_bufg is None:
+            cn6_bufg = Signal()
+            self.specials += Instance("BUFG", name="pd_bufg", i_I=cn6, o_O=cn6_bufg)
 
-        # Fabric copy of the pad for the samplers below, through an explicit LUT: with the
-        # MultiRegs directly on the IOBUF output, synthesis may trace them to the port and insert
-        # a second input buffer (DRC MDRV-1).
-        cn6_fab = Signal()
-        self.specials += Instance("LUT1", name="pd_cn6_lut", p_INIT=2, i_I0=cn6, o_O=cn6_fab,
-            attr={("dont_touch", "true")})
+        # The samplers below take the pad level from the BUFG output (clock as data), so the IOBUF
+        # output only drives clock buffers (fabric loads would also make Vivado insert a LUT, and
+        # direct MultiRegs on it can make synthesis add a second input buffer, DRC MDRV-1).
+        cn6_fab = cn6_bufg
 
         mmcm_rst  = self.control.fields.mmcm_rst
         pd_locked = Signal()

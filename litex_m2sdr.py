@@ -303,7 +303,7 @@ class CRG(LiteXModule):
 
         # CN6 10MHz -> 100MHz. The explicit BUFG keeps Vivado from inserting a second input buffer
         # on the bidirectional CN6 pad.
-        cn6_bufg = Signal()
+        self.cn6_bufg = cn6_bufg = Signal()
         self.specials += Instance("BUFG", name="cn6_bufg", i_I=self.cn6_in, o_O=cn6_bufg)
         self.cn6_mmcm = cn6_mmcm = S7MMCM(speedgrade=-3, name="cn6_mmcm")
         cn6_mmcm.register_clkin(cn6_bufg, ref_freq)
@@ -1047,14 +1047,15 @@ class BaseSoC(SoCMini):
         # Phase Detector (sub-sample alignment over CN6) --------------------------------------------
 
         if with_phase_detector:
-            self.phase_detector = PhaseDetector(cn6=self.sync_clk_out.i, rx_count=self.ad9361.phy.rx_count)
+            self.phase_detector = PhaseDetector(cn6=self.sync_clk_out.i, rx_count=self.ad9361.phy.rx_count,
+                cn6_bufg = self.crg.cn6_bufg if with_sync_slave else None)
             # Marker-based timestamp capture/load, through the time generator's discipline write
             # port (otherwise only used by the Ethernet PTP discipline).
             if with_eth_ptp:
                 raise ValueError("--with-phase-detector and --with-eth-ptp both drive the time discipline port.")
             self.phase_detector.add_time(self.time_gen)
             platform.add_platform_command(
-                "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins -hierarchical -filter {{NAME =~ *pd_bufg/I}}]]")
+                "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -quiet -of_objects [get_pins -quiet -hierarchical -filter {{NAME =~ *pd_bufg/I}}]]")
             pd = self.phase_detector
             for clk in [pd.cd_pd_ref.clk, pd.cd_pd_det.clk, pd.cd_pd_ps.clk]:
                 platform.add_false_path_constraints(self.crg.cd_sys.clk, clk)
