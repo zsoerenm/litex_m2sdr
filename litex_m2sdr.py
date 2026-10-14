@@ -1048,6 +1048,11 @@ class BaseSoC(SoCMini):
 
         if with_phase_detector:
             self.phase_detector = PhaseDetector(cn6=self.sync_clk_out.i, rx_count=self.ad9361.phy.rx_count)
+            # Marker-based timestamp capture/load, through the time generator's discipline write
+            # port (otherwise only used by the Ethernet PTP discipline).
+            if with_eth_ptp:
+                raise ValueError("--with-phase-detector and --with-eth-ptp both drive the time discipline port.")
+            self.phase_detector.add_time(self.time_gen)
             platform.add_platform_command(
                 "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins -hierarchical -filter {{NAME =~ *pd_bufg/I}}]]")
             pd = self.phase_detector

@@ -155,6 +155,13 @@ class PhaseDetector(LiteXModule):
         cn6_bufg = Signal()
         self.specials += Instance("BUFG", name="pd_bufg", i_I=cn6, o_O=cn6_bufg)
 
+        # Fabric copy of the pad for the samplers below, through an explicit LUT: with the
+        # MultiRegs directly on the IOBUF output, synthesis may trace them to the port and insert
+        # a second input buffer (DRC MDRV-1).
+        cn6_fab = Signal()
+        self.specials += Instance("LUT1", name="pd_cn6_lut", p_INIT=2, i_I0=cn6, o_O=cn6_fab,
+            attr={("dont_touch", "true")})
+
         mmcm_rst  = self.control.fields.mmcm_rst
         pd_locked = Signal()
         ps_locked = Signal()
@@ -193,12 +200,13 @@ class PhaseDetector(LiteXModule):
         # Marker detection and period labels.
         # -----------------------------------
         det_sample = Signal(reset=1)
-        self.specials += MultiReg(cn6, det_sample, odomain="pd_det", reset=1)  # 1st stage samples.
+        self.specials += MultiReg(cn6_fab, det_sample, odomain="pd_det", reset=1)  # 1st stage samples.
         det_marker = Signal()
         self.sync.pd_det += det_marker.eq(~det_sample)
 
         label    = Signal(3)
         marker   = Signal()
+        self._marker = marker  # pd_ref: one cycle per detected marker.
         r        = Signal()
         detected = Signal(16)
         relabel  = Signal(16)
@@ -227,7 +235,7 @@ class PhaseDetector(LiteXModule):
         self.specials += [
             MultiReg(s,   s_ps, odomain="pd_ps"),
             MultiReg(r,   r_ps, odomain="pd_ps"),
-            MultiReg(cn6, c_ps, odomain="pd_ps"),
+            MultiReg(cn6_fab, c_ps, odomain="pd_ps"),
         ]
         # Blocks of NSAMPLES x NLABELS cycles: per label, count the high samples of each signal.
         # The first cycle of a block latches the previous block's counts and toggles "toggle".
@@ -325,3 +333,60 @@ class PhaseDetector(LiteXModule):
             )
         )
         self.comb += ps_psincdec.eq(1)
+
+    def add_time(self, time_gen):
+        """Marker-based timestamp capture and load (time domain of the TimeGenerator).
+
+        Each marker latches the FPGA time; a board armed with a load value sets its time to it at
+        the next marker, through the time generator's discipline write port. Both boards see the
+        marker on the same reference edge; the transfer to the time domain (unrelated 100MHz from
+        the SI5351C) adds 2-3 time ticks, so captures and loads agree to one tick (10ns).
+        """
+        self.time_ctrl   = CSRStorage(fields=[
+            CSRField("arm", size=1, offset=0, pulse=True, description="Load time_load at the next marker."),
+        ])
+        self.time_load   = CSRStorage(64, description="Time (ns) loaded at the next marker when armed.")
+        self.time_cap    = CSRStatus(64, description="Time (ns) at the last marker (before any load).")
+        self.time_status = CSRStatus(fields=[
+            CSRField("captures", size=16, offset=0, description="Markers captured."),
+            CSRField("armed",    size=1,  offset=16),
+        ])
+
+        # # #
+
+        # Marker -> time domain (toggle + MultiReg).
+        toggle = Signal()
+        self.sync.pd_ref += If(self._marker, toggle.eq(~toggle))
+        toggle_t   = Signal()
+        toggle_t_d = Signal()
+        event      = Signal()
+        self.specials += MultiReg(toggle, toggle_t, odomain="time")
+        self.sync.time += toggle_t_d.eq(toggle_t)
+        self.comb += event.eq(toggle_t != toggle_t_d)
+
+        arm = PulseSynchronizer("sys", "time")
+        self.submodules += arm
+        self.comb += arm.i.eq(self.time_ctrl.fields.arm)
+        load_t = Signal(64)
+        self.specials += MultiReg(self.time_load.storage, load_t, odomain="time")
+
+        armed    = Signal()
+        cap      = Signal(64)
+        captures = Signal(16)
+        self.sync.time += [
+            If(arm.o, armed.eq(1)),
+            If(event,
+                cap.eq(time_gen.time),
+                captures.eq(captures + 1),
+                If(armed, armed.eq(0)),
+            ),
+        ]
+        self.comb += [
+            time_gen.discipline_write.eq(event & armed),
+            time_gen.discipline_write_time.eq(load_t),
+        ]
+        self.specials += [
+            MultiReg(cap,      self.time_cap.status),
+            MultiReg(captures, self.time_status.fields.captures),
+            MultiReg(armed,    self.time_status.fields.armed),
+        ]
