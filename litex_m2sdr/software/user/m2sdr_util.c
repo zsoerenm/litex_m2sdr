@@ -1302,6 +1302,12 @@ static void info(void)
         ((1 << CSR_CAPABILITY_FEATURES_RFIC_OVERSAMPLING_SIZE) - 1);
     printf("  Oversampling   : %s\n", rfic_oversampling_enabled ? "Yes (128-bit, 2T2R@122.88)" : "No");
 #endif
+#ifdef CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_OFFSET
+    bool sync_clk_out_enabled =
+        (caps.features >> CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_OFFSET) &
+        ((1 << CSR_CAPABILITY_FEATURES_SYNC_CLK_OUT_SIZE) - 1);
+    printf("  Sync ClkOut    : %s\n", sync_clk_out_enabled ? "Yes" : "No");
+#endif
 
     if (pcie_enabled) {
         int pcie_speed = (caps.pcie_config >> CSR_CAPABILITY_PCIE_CONFIG_SPEED_OFFSET) & ((1 << CSR_CAPABILITY_PCIE_CONFIG_SPEED_SIZE) - 1);
@@ -4185,6 +4191,40 @@ static void agc_status(void)
     m2sdr_close_dev(conn);
 }
 
+static void sync_clk_out(int mode)
+{
+    struct m2sdr_dev *conn = m2sdr_open_dev();
+    bool enabled = false;
+    int rc;
+
+    if (mode >= 0) {
+        rc = m2sdr_set_sync_clk_out(conn, mode ? true : false);
+        if (rc != M2SDR_ERR_OK) {
+            fprintf(stderr, "m2sdr_set_sync_clk_out failed: %s\n", m2sdr_strerror(rc));
+            m2sdr_close_dev(conn);
+            exit(1);
+        }
+    }
+
+    printf("\e[1m[> Sync ClkOut (SYNCDBG_CLK/CN6):\e[0m\n");
+    printf("--------------------------------\n");
+    rc = m2sdr_get_sync_clk_out(conn, &enabled);
+    if (rc == M2SDR_ERR_OK)
+        printf("Output           : %s\n", enabled ? "on (driving FPGA clk10)" : "off (input only)");
+    else
+        printf("Output           : unavailable (%s)\n", m2sdr_strerror(rc));
+#ifdef CSR_SI5351_CONTROL_ADDR
+    {
+        uint32_t control = 0;
+        if (m2sdr_reg_read(conn, CSR_SI5351_CONTROL_ADDR, &control) == M2SDR_ERR_OK)
+            printf("SI5351 ClkIn Src : %s\n",
+                ((control >> CSR_SI5351_CONTROL_CLKIN_SRC_OFFSET) & 1u) ? "external (uFL/CN6)" : "FPGA clk10");
+    }
+#endif
+
+    m2sdr_close_dev(conn);
+}
+
 static int agc_counter_configure(enum m2sdr_agc_detector detector, uint16_t threshold, bool enable)
 {
     struct m2sdr_dev *conn = m2sdr_open_dev();
@@ -4267,6 +4307,8 @@ static void help(void)
            "      Read an FPGA register.\n"
            "  reg-write OFFSET VALUE\n"
            "      Write an FPGA register.\n"
+           "  sync-clk-out [on|off|status]\n"
+           "      Drive the FPGA 10MHz clock out on SYNCDBG_CLK/CN6 (clock master only).\n"
            "  agc-status\n"
            "      Show RF_EN_AGC pin state and FPGA AGC saturation counters.\n"
            "  agc-counter DETECTOR THRESHOLD [enable|disable]\n"
@@ -4614,6 +4656,22 @@ int main(int argc, char **argv)
         if (!parse_next_u32_arg("offset", argv, &optind, &offset))
             exit(1);
         test_reg_read(offset);
+    }
+    else if (cmd_is(cmd, "sync_clk_out", "sync-clk-out")) {
+        int mode = -1;
+
+        if (optind < argc) {
+            const char *arg = argv[optind++];
+            if (!strcmp(arg, "on"))
+                mode = 1;
+            else if (!strcmp(arg, "off"))
+                mode = 0;
+            else if (strcmp(arg, "status") != 0)
+                goto show_help;
+        }
+        if (optind < argc)
+            goto show_help;
+        sync_clk_out(mode);
     }
     else if (cmd_is(cmd, "agc_status", "agc-status")) {
         if (optind < argc)

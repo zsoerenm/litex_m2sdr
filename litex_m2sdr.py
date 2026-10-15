@@ -52,6 +52,7 @@ from litex_m2sdr import Platform, _io_baseboard
 from litex_m2sdr.gateware.capability       import Capability
 from litex_m2sdr.gateware.clock_discipline import MMCMPhaseDiscipline, PTPClock10Discipline
 from litex_m2sdr.gateware.si5351           import SI5351
+from litex_m2sdr.gateware.phase_detector   import SyncMarkerTx, PhaseDetector
 from litex_m2sdr.gateware.ad9361.core import AD9361RFIC
 from litex_m2sdr.gateware.qpll        import SharedQPLL
 from litex_m2sdr.gateware.time        import TimeGenerator, TimeNsToPS
@@ -158,7 +159,8 @@ def get_eth_phy_kwargs(eth_phy):
 
 class CRG(LiteXModule):
     def __init__(self, platform, sys_clk_freq, with_eth=False, eth_refclk_freq=125e6,
-        eth_refclk_direct=False, with_sata=False, with_white_rabbit=False):
+        eth_refclk_direct=False, with_sata=False, with_white_rabbit=False, sync_slave=False,
+        sync_ref_freq=10e6):
         self.rst              = Signal()
         self.cd_sys           = ClockDomain()
         self.cd_clk10         = ClockDomain()
@@ -182,20 +184,38 @@ class CRG(LiteXModule):
         # Clk / Rst.
         # ----------
         clk100 = platform.request("clk100")
+        clk_rst  = Signal()
+        pll_rst  = self.rst
+        if sync_slave:
+            clk100 = self.add_sync_slave_ref(clk100, sync_ref_freq)
+            clk_rst = self.ref_switch_rst
+            pll_rst = self.soc_rst_local
+            # Second input of the PLL/MMCM: the CN6-derived 100MHz, selected by ref_sel_cn6.
+            ref_inputs = dict(
+                p_CLKIN2_PERIOD = 10.0,
+                i_CLKIN2        = self.cd_cn6_100.clk,
+                i_CLKINSEL      = ~self.ref_sel_cn6,  # 1: CLKIN1 (local), 0: CLKIN2 (CN6).
+            )
 
         # PLL.
         # ----
         self.pll = pll = S7PLL(speedgrade=-3)
-        self.comb += self.pll.reset.eq(self.rst)
+        self.comb += self.pll.reset.eq(pll_rst | clk_rst)
         pll.register_clkin(clk100, 100e6)
+        if sync_slave:
+            pll.params.update(ref_inputs)
         pll.create_clkout(self.cd_sys,    sys_clk_freq)
         if not with_white_rabbit:
             # Keep clk10 on a dedicated MMCM so the SI5351C FPGA CLKIN path can be phase-steered later.
             self.clk10_mmcm = clk10_mmcm = S7MMCM(speedgrade=-3, fractional=False)
-            self.comb += clk10_mmcm.reset.eq(self.rst)
+            self.comb += clk10_mmcm.reset.eq(pll_rst | clk_rst)
             clk10_mmcm.register_clkin(clk100, 100e6)
+            if sync_slave:
+                clk10_mmcm.params.update(ref_inputs)
             clk10_mmcm.expose_dps("clk200", with_csr=False)
-            clk10_mmcm.create_clkout(self.cd_clk10, 10e6, margin=0)
+            # The "clk10" domain carries the shared reference (10MHz, or 38.4MHz so that the SI5351C
+            # PLL runs integer-N: 22 x 38.4MHz = 844.8MHz).
+            clk10_mmcm.create_clkout(self.cd_clk10, sync_ref_freq, margin=0)
             clk10_mmcm.params.update(p_CLKOUT0_USE_FINE_PS="TRUE")
         pll.create_clkout(self.cd_idelay, 200e6)
         self.comb += [
@@ -253,6 +273,135 @@ class CRG(LiteXModule):
             self.dmtd_mmcm.expose_dps("clk200", with_csr=False)
             self.dmtd_mmcm.params.update(p_CLKOUT0_USE_FINE_PS="TRUE")
 
+    def add_sync_slave_ref(self, clk100_pad, ref_freq=10e6):
+        """Run the FPGA clocks of a clock-slave board from the master's 10MHz on CN6.
+
+        The received reference (self.cn6_in, ref_freq, connected by the SoC) is converted to 100MHz by an MMCM
+        and fed to the second clock input of the main PLL and the clk10 MMCM. Once it has been
+        locked for ~10ms it is selected instead of the local 100MHz oscillator; on loss of lock the
+        local oscillator is selected again. The selection runs from the local oscillator, needs no
+        software and resets the PLL/MMCM on every switch (the sys domain is reset; the PCIe link,
+        reset only by PERST, stays up). With every FPGA clock derived from the shared reference,
+        on-chip coupling into the reference path can only add a constant phase instead of beat
+        spurs at (n x 125MHz) x (oscillator offset).
+        Returns the local oscillator (BUFG output) for CLKIN1: with clock switching, CLKIN1 and
+        CLKIN2 must come from the same buffer type (DRC REQP-119).
+        """
+        self.cn6_in          = Signal(attr={("dont_touch", "true")})
+        self.ref_switch_rst  = Signal()
+        self.soc_rst_local   = Signal()
+        self.ref_sel_cn6     = Signal()
+        self.cd_clk100_local = ClockDomain(reset_less=True)
+        self.cd_cn6_100      = ClockDomain(reset_less=True)
+
+        # Local 100MHz oscillator: one BUFG for CLKIN1 and the selection logic.
+        clk100_ibuf = Signal()
+        self.specials += [
+            Instance("IBUF", i_I=clk100_pad, o_O=clk100_ibuf),
+            Instance("BUFG", i_I=clk100_ibuf, o_O=self.cd_clk100_local.clk),
+        ]
+
+        # CN6 10MHz -> 100MHz. The explicit BUFG keeps Vivado from inserting a second input buffer
+        # on the bidirectional CN6 pad.
+        self.cn6_bufg = cn6_bufg = Signal()
+        self.specials += Instance("BUFG", name="cn6_bufg", i_I=self.cn6_in, o_O=cn6_bufg)
+        self.cn6_mmcm = cn6_mmcm = S7MMCM(speedgrade=-3, name="cn6_mmcm")
+        cn6_mmcm.register_clkin(cn6_bufg, ref_freq)
+        cn6_mmcm.create_clkout(self.cd_cn6_100, 100e6, with_reset=False, margin=0)
+
+        # Selection (local oscillator domain, always running).
+        cn6_locked = Signal()
+        stable     = Signal(21)  # 2^20 cycles = 10.5ms locked before switching to CN6.
+        retry      = Signal(24)  # While unlocked, reset the CN6 MMCM every 168ms to re-acquire.
+        rst_cnt    = Signal(12)
+        self.specials += MultiReg(cn6_mmcm.locked, cn6_locked, odomain="clk100_local")
+        self.comb += cn6_mmcm.reset.eq(retry[23] & (retry[10:23] == 0))
+        self.sync.clk100_local += [
+            If(cn6_locked,
+                If(~stable[20], stable.eq(stable + 1)),
+                retry.eq(0),
+            ).Else(
+                stable.eq(0),
+                retry.eq(retry + 1),
+            ),
+            If(stable[20] != self.ref_sel_cn6,
+                self.ref_sel_cn6.eq(stable[20]),
+                rst_cnt.eq(2**12 - 1),
+            ).Elif(rst_cnt != 0,
+                rst_cnt.eq(rst_cnt - 1),
+            ),
+            self.ref_switch_rst.eq(rst_cnt != 0),
+        ]
+
+        # SoC reset requests (self.rst, a one-cycle pulse from the sys-domain CSR) become a
+        # fixed-length PLL/MMCM reset generated here: driven directly, the pulse could stop its
+        # own clock and never deassert, leaving the sys domain dead.
+        rst_req   = Signal()
+        rst_req_d = Signal()
+        soc_cnt   = Signal(13)
+        self.specials += MultiReg(self.rst, rst_req, odomain="clk100_local")
+        self.sync.clk100_local += [
+            rst_req_d.eq(rst_req),
+            If(rst_req & ~rst_req_d,
+                soc_cnt.eq(2**13 - 1),
+            ).Elif(soc_cnt != 0,
+                soc_cnt.eq(soc_cnt - 1),
+            ),
+            self.soc_rst_local.eq(soc_cnt != 0),
+        ]
+        return self.cd_clk100_local.clk
+
+# SyncClkOut ---------------------------------------------------------------------------------------
+
+class SyncClkOut(LiteXModule):
+    """Bidirectional SYNCDBG_CLK (CN6) pad.
+
+    The input path always feeds the SI5351 ClkIn mux (uFL/external source). When oe is set, the
+    pad also forwards clk10 (the FPGA 10MHz reference fed to the SI5351C in fpga mode) through an
+    ODDR so a second board can lock to it with --sync external. oe resets to 0: after power-on the
+    pad is never driven until software explicitly enables it on the clock master.
+    """
+    def __init__(self, pad, ref_freq=10e6, ddr=None):
+        # ddr: (clk, d1, d2) for the output ODDR instead of (clk10, 1, 0), see SyncMarkerTx.
+        self.i = Signal()
+
+        self.control = CSRStorage(fields=[
+            CSRField("oe", size=1, offset=0, reset=0, values=[
+                ("``0b0``", "Pad is an input (ClkIn only)."),
+                ("``0b1``", "Pad drives clk10 (10MHz ClkOut)."),
+            ]),
+        ])
+        self.ref_freq = CSRStatus(32, reset=int(ref_freq),
+            description="Frequency of the shared reference (clk10 domain, CN6 and SI5351C CLKIN) in Hz.")
+
+        # # #
+
+        # Resynchronize Output Enable to clk10 (resets to 0 with clk10).
+        oe = Signal()
+        self.specials += MultiReg(self.control.fields.oe, oe, odomain="clk10")
+
+        # Forward clk10 through an ODDR.
+        o = Signal()
+        ddr_clk, ddr_d1, ddr_d2 = ddr if ddr is not None else (ClockSignal("clk10"), 1, 0)
+        self.specials += Instance("ODDR",
+            p_DDR_CLK_EDGE = "SAME_EDGE",
+            i_C  = ddr_clk,
+            i_CE = 1,
+            i_S  = 0,
+            i_R  = 0,
+            i_D1 = ddr_d1,
+            i_D2 = ddr_d2,
+            o_Q  = o,
+        )
+
+        # Bidirectional Buffer.
+        self.specials += Instance("IOBUF",
+            i_I   = o,
+            i_T   = ~oe,
+            o_O   = self.i,
+            io_IO = pad,
+        )
+
 # BaseSoC ------------------------------------------------------------------------------------------
 
 class BaseSoC(SoCMini):
@@ -309,6 +458,9 @@ class BaseSoC(SoCMini):
         "ad9361"           : 24,
         "crossbar"         : 25,
         "txrx_loopback"    : 33,
+        "sync_clk_out"     : 43,
+        "sync_marker_tx"   : 44,
+        "phase_detector"   : 45,
 
         # Measurements/Analyzer.
         "clk_measurement"  : 30,
@@ -332,6 +484,9 @@ class BaseSoC(SoCMini):
         with_gpio              = False,
         pps_input              = "m2",
         with_rfic_oversampling = False,
+        with_sync_slave        = False,
+        sync_ref_freq          = 10e6,
+        with_phase_detector    = False,
     ):
         if pps_input in ("tp1", "tp2") and with_gpio:
             raise ValueError("PPS input on TP1/TP2 cannot be used with --with-gpio.")
@@ -393,7 +548,10 @@ class BaseSoC(SoCMini):
             eth_refclk_direct = with_eth and (eth_phy == "2500basex"),
             with_sata         = with_sata,
             with_white_rabbit = with_white_rabbit,
+            sync_slave        = with_sync_slave,
+            sync_ref_freq     = sync_ref_freq,
         )
+        platform.sync_ref_freq = sync_ref_freq
 
         # Shared QPLL.
         self.qpll = SharedQPLL(platform,
@@ -441,6 +599,9 @@ class BaseSoC(SoCMini):
             # RFIC.
             rfic_oversampling = with_rfic_oversampling,
 
+            # Clocking.
+            sync_clk_out    = True,
+
             # Board.
             variant        = variant,
             jtagbone       = with_jtagbone,
@@ -450,14 +611,54 @@ class BaseSoC(SoCMini):
 
         # SI5351 Clock Generator -------------------------------------------------------------------
 
+        # CN6 Duty-Cycle Marker (Clock Master) ----------------------------------------------------
+
+        if with_phase_detector:
+            if sync_ref_freq != 38.4e6:
+                raise ValueError("The phase detector requires --sync-ref-freq 38.4e6.")
+            if not with_sync_slave:
+                # CN6 and the SI5351C FPGA ClkIn both from the 2x marker clock (same edges).
+                self.sync_marker_tx = SyncMarkerTx()
+
         # SI5351 Control.
         si5351_pads   = platform.request("si5351")
         si5351_i2c_base = self.get_csr_address("si5351")
-        self.si5351 = SI5351(pads=si5351_pads, i2c_base=si5351_i2c_base)
+        marker_tx = getattr(self, "sync_marker_tx", None)
+        self.si5351 = SI5351(pads=si5351_pads, i2c_base=si5351_i2c_base,
+            clkin_fpga_clk = None if marker_tx is None else ClockSignal("cn6x2"),
+            clkin_fpga_ph  = None if marker_tx is None else marker_tx.ph)
         self.bus.add_master(name="si5351", master=self.si5351.sequencer.bus)
 
-        # SI5351 ClkIn Ext/uFL.
-        self.comb += self.si5351.clkin_ufl.eq(platform.request("sync_clk_in"))
+        # SI5351 ClkIn Ext/uFL + switchable 10MHz ClkOut on the same pin (SYNCDBG_CLK/CN6).
+        self.sync_clk_out = SyncClkOut(pad=platform.request("sync_clk_in"), ref_freq=sync_ref_freq,
+            ddr = None if marker_tx is None else (ClockSignal("cn6x2"), marker_tx.cn6_d1, marker_tx.cn6_d2))
+        if with_sync_slave or with_phase_detector:
+            # Keep the IOBUF output net: otherwise synthesis may connect cn6_bufg/pd_bufg to the port
+            # and infer a second input buffer (DRC MDRV-1, multiple drivers on sync_clk_in).
+            self.sync_clk_out.i.attr.add(("dont_touch", "true"))
+            platform.add_platform_command("set_property IO_BUFFER_TYPE NONE [get_ports sync_clk_in]")
+        if with_sync_slave:
+            # FPGA clocks follow the 10MHz received on CN6 (clock-slave boards only, see CRG).
+            self.comb += self.crg.cn6_in.eq(self.sync_clk_out.i)
+            platform.add_platform_command(
+                "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins -hierarchical -filter {{NAME =~ *cn6_bufg/I}}]]")
+            # Every PLL/MMCM output exists twice (local oscillator / CN6 reference), never both at once.
+            platform.toolchain.pre_placement_commands += [
+                "set _local [get_clocks -quiet -include_generated_clocks clk100]",
+                "set _cn6 [get_clocks -quiet -include_generated_clocks -of_objects [get_pins -hierarchical -filter {{NAME =~ *cn6_mmcm/CLKOUT0}}]]",
+                "if {{[llength $_local] && [llength $_cn6]}} {{",
+                "    set_clock_groups -physically_exclusive -group $_local -group $_cn6",
+                "}}",
+                # The local oscillator and the received reference are unrelated (CDC only, e.g.
+                # the CN6 MMCM re-acquire reset); with a 38.4MHz reference the periods are no
+                # longer multiples and the timer would find near-coincident edges.
+                "set _ref [get_clocks -quiet sync_clk_in]",
+                "set _osc [get_clocks -quiet clk100]",
+                "if {{[llength $_ref] && [llength $_osc]}} {{",
+                "    set_clock_groups -asynchronous -group $_osc -group $_ref",
+                "}}",
+            ]
+        self.comb += self.si5351.clkin_ufl.eq(self.sync_clk_out.i)
 
         # SI5351 ClkIn/Out.
         si5351_clk0   = platform.request("si5351_clk0")
@@ -842,6 +1043,29 @@ class BaseSoC(SoCMini):
             oversampling   = with_rfic_oversampling,
         )
         self.ad9361.add_prbs()
+
+        # Phase Detector (sub-sample alignment over CN6) --------------------------------------------
+
+        if with_phase_detector:
+            self.phase_detector = PhaseDetector(cn6=self.sync_clk_out.i, rx_count=self.ad9361.phy.rx_count,
+                cn6_bufg = self.crg.cn6_bufg if with_sync_slave else None)
+            # Marker-based timestamp capture/load, through the time generator's discipline write
+            # port (otherwise only used by the Ethernet PTP discipline).
+            if with_eth_ptp:
+                raise ValueError("--with-phase-detector and --with-eth-ptp both drive the time discipline port.")
+            self.phase_detector.add_time(self.time_gen)
+            platform.add_platform_command(
+                "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -quiet -of_objects [get_pins -quiet -hierarchical -filter {{NAME =~ *pd_bufg/I}}]]")
+            pd = self.phase_detector
+            for clk in [pd.cd_pd_ref.clk, pd.cd_pd_det.clk, pd.cd_pd_ps.clk]:
+                platform.add_false_path_constraints(self.crg.cd_sys.clk, clk)
+            platform.add_false_path_constraints(self.ad9361.cd_rfic.clk, pd.cd_pd_ps.clk)
+            # pd_ref -> pd_ps only through MultiRegs; pd_det -> pd_ref is a timed synchronous path.
+            if marker_tx is not None:
+                platform.add_false_path_constraints(self.crg.cd_sys.clk, marker_tx.cd_cn6x2.clk)
+                # cn6x2 BUFG -> SI5351 ClkIn BUFGMUX cascade (as clk10 without the phase detector).
+                platform.add_platform_command(
+                    "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -hierarchical -quiet {{cn6x2_clk}}]")
         self.ad9361.add_agc()
 
         # TX/RX Header Extracter/Inserter ----------------------------------------------------------
@@ -1209,7 +1433,7 @@ class BaseSoC(SoCMini):
             "ad9361_rfic_ctrl* ad9361_rfic_en_agc ad9361_rfic_enable ad9361_rfic_rst_n ad9361_rfic_txnrx "
             "ad9361_spi_clk ad9361_spi_cs_n ad9361_spi_mosi "
             "flash_cs_n flash_mosi "
-            "si5351_scl si5351_sda si5351_pwm"
+            "si5351_scl si5351_sda si5351_pwm sync_clk_in"
             "}}]"
         )
 
@@ -1638,6 +1862,9 @@ def main():
 
     # RFIC parameters.
     parser.add_argument("--with-rfic-oversampling", action="store_true", help="Double the RFIC clock to enable the oversampling mode.")
+    parser.add_argument("--sync-ref-freq",          default=10e6, type=float, help="Shared reference on CN6 / SI5351C CLKIN in Hz: 10e6 or 38.4e6 (integer-N SI5351C PLL).")
+    parser.add_argument("--with-phase-detector",    action="store_true", help="CN6 duty-cycle marker (master) and wire-based sub-sample phase detector (needs --sync-ref-freq 38.4e6).")
+    parser.add_argument("--with-sync-slave",        action="store_true", help="Clock-slave board: run the FPGA clocks from the 10MHz on CN6 once present (do not use on the clock master).")
 
     # PCIe parameters.
     parser.add_argument("--with-pcie",       action="store_true", help="Enable PCIe Communication.")
@@ -1743,6 +1970,9 @@ def main():
 
         # RFIC.
         with_rfic_oversampling = args.with_rfic_oversampling,
+        with_sync_slave        = args.with_sync_slave,
+        sync_ref_freq          = args.sync_ref_freq,
+        with_phase_detector    = args.with_phase_detector,
 
         # PCIe.
         with_pcie     = args.with_pcie,
@@ -1842,6 +2072,12 @@ def main():
                 r += f"_{args.wr_cpu_boot}"
         if args.with_rfic_oversampling:
             r += "_rfic_oversampling"
+        if args.with_sync_slave:
+            r += "_sync_slave"
+        if args.sync_ref_freq != 10e6:
+            r += f"_ref{args.sync_ref_freq/1e6:g}m".replace(".", "p")
+        if args.with_phase_detector:
+            r += "_pd"
         if args.without_jtagbone:
             r += "_no_jtagbone"
         return r

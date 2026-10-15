@@ -253,6 +253,99 @@ M2SDR_CONFIG_DEF M2SDR_CONFIG_UNUSED const uint8_t si5351_clkin_10m_38p4m_config
     /* Crystal Load Capacitance */
     { 0xB7, 0x12 }, // XTAL_CL=0 (6pF loading)
 };
+/* SI5351C Config from a 38.4MHz CLKIN (shared reference, --sync-ref-freq 38.4e6) to 38.4MHz on  */
+/* MS0, MS4 and 100MHz on MS1. PLLB and MS0/MS4 run integer-N (lowest jitter on the AD9361 ref). */
+/*------------------------------------------------------------------------------------------------*/
+M2SDR_CONFIG_DEF M2SDR_CONFIG_UNUSED const uint8_t si5351_clkin_38p4m_38p4m_config[][2] = {
+    /* Interrupt Mask Configuration */
+    { 0x02, 0x33 },  // Int masks: CLK_LOS(1), LOL_A(1) enabled, XO_LOS(0), LOL_B(0), SYS_INIT(0) disabled
+
+    /* Output Enable Control */
+    { 0x03, 0x00 },  // All CLK outputs enabled via register (OEB pin disabled)
+
+    /* PLL Reset Control */
+    { 0x04, 0x10 },  // Disable reset on PLLA LOS (bit4=1), PLLB reset normal (bit5=0)
+
+    /* I2C Configuration */
+    { 0x07, 0x01 },  // I2C address: 0x60 (default)
+
+    /* Clock Input Configuration */
+    { 0x0F, 0x08 },  // PLLB, src=CLKIN (38.4MHz), CLKIN_DIV=1 (PFD 38.4MHz).
+
+    /* Output Channel Configuration (CLK0-CLK7) */
+    { 0x10, 0x6D },  // CLK0: LVCMOS 4mA, MS0 src=PLLB, MS0_INT (even integer divider)
+    { 0x11, 0x2D },  // CLK1: LVCMOS 4mA, MS1 src=PLLB
+    { 0x12, 0x8C },  // CLK2: OFF.
+    { 0x13, 0x8C },  // CLK3: OFF.
+    { 0x14, 0x6D },  // CLK4: LVCMOS 4mA, MS4 src=PLLB, MS4_INT (even integer divider)
+    { 0x15, 0x8C },  // CLK5: OFF.
+    { 0x16, 0x8C },  // CLK6: OFF.
+    { 0x17, 0xCC },  // CLK7: OFF. FBB_INT: PLLB feedback in integer mode.
+
+    /* PLLB Configuration (VCO = 844.8MHz = 22 x 38.4MHz, integer: P1=0x900, P2=0, P3=1) */
+    { 0x22, 0x00 },
+    { 0x23, 0x01 },
+    { 0x24, 0x00 },
+    { 0x25, 0x09 },
+    { 0x26, 0x00 },
+    { 0x27, 0x00 },
+    { 0x28, 0x00 },
+    { 0x29, 0x00 },
+    /* MS0 Configuration (Output Divider 22 for 38.4MHz) */
+    { 0x2A, 0x00 },
+    { 0x2B, 0x01 },
+    { 0x2C, 0x00 },
+    { 0x2D, 0x09 },
+    { 0x2E, 0x00 },
+    { 0x2F, 0x00 },
+    { 0x30, 0x00 },
+    { 0x31, 0x00 },
+
+    /* MS1 Configuration (Output Divider 8.448 for 100MHz) */
+    { 0x32, 0x00 },
+    { 0x33, 0x7D },
+    { 0x34, 0x00 },
+    { 0x35, 0x02 },
+    { 0x36, 0x39 },
+    { 0x37, 0x00 },
+    { 0x38, 0x00 },
+    { 0x39, 0x2B },
+
+    /* MS4 Configuration (Output Divider 22 for 38.4MHz) */
+    { 0x4A, 0x00 },
+    { 0x4B, 0x01 },
+    { 0x4C, 0x00 },
+    { 0x4D, 0x09 },
+    { 0x4E, 0x00 },
+    { 0x4F, 0x00 },
+    { 0x50, 0x00 },
+    { 0x51, 0x00 },
+
+    /* Spread-Spectrum, Fractional Stepping Disabled */
+    { 0x95, 0x00 },
+    { 0x96, 0x00 },
+    { 0x97, 0x00 },
+    { 0x98, 0x00 },
+    { 0x99, 0x00 },
+    { 0x9A, 0x00 },
+    { 0x9B, 0x00 },
+
+    /* VCXO Configuration */
+    { 0xA2, 0x00 },
+    { 0xA3, 0x00 },
+    { 0xA4, 0x00 },
+
+    /* Phase Offset Configuration */
+    { 0xA5, 0x00 },
+    { 0xA6, 0x00 },
+    { 0xA7, 0x00 },
+    { 0xA8, 0x00 },
+    { 0xA9, 0x00 },
+    { 0xAA, 0x00 },
+
+    /* Crystal Load Capacitance */
+    { 0xB7, 0x12 }, // XTAL_CL=0 (6pF loading)
+};
 
 /* SI5351B-C Config from XO to 40MHz on MS0, MS4 and 100MHz on MS1. */
 /*------------------------------------------------------------------*/

@@ -200,6 +200,8 @@ int32_t ad9361_init (struct ad9361_rf_phy **ad9361_phy,
 	phy->pdata->tx_synth_freq = init_param->tx_synthesizer_frequency_hz;
 	phy->pdata->lo_powerdown_managed_en =
 		init_param->tx_lo_powerdown_managed_enable;
+	phy->pdata->rx_rfpll_cp_current_ua = init_param->rx_rfpll_cp_current_ua;
+	phy->pdata->tx_rfpll_cp_current_ua = init_param->tx_rfpll_cp_current_ua;
 
 	/* Rate & BW Control */
 	for(i = 0; i < 6; i++) {

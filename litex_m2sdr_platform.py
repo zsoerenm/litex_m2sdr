@@ -31,8 +31,8 @@ _io = [
     # Debug.
     ("debug", 0, Pins("V13"), IOStandard("LVCMOS33")), # SYNCDBG_CLK.
 
-    # Ext Sync/ClkIn..
-    ("sync_clk_in", 0, Pins("V13"), IOStandard("LVCMOS33")), # SYNCDBG_CLK.
+    # Ext Sync/ClkIn.. (Bidirectional: 10MHz ClkIn to SI5351, or switchable 10MHz ClkOut, see SyncClkOut).
+    ("sync_clk_in", 0, Pins("V13"), IOStandard("LVCMOS33"), Misc("SLEW=SLOW"), Misc("DRIVE=8")), # SYNCDBG_CLK.
     ("pps_in", 0, Pins("M2:NC22"), IOStandard("LVCMOS33")), # M.2 pin 22 / PPS_IN.
 
     # SI5351 Clocking.
@@ -264,4 +264,4 @@ class Platform(Xilinx7SeriesPlatform):
         self.add_period_constraint(self.lookup_request("si5351_clk0",          0, loose=True), 1e9/38.4e6)         # Local VCTCXO.
         self.add_period_constraint(self.lookup_request("si5351_clk1",          0, loose=True), 1e9/100e6)          # Time/PPS reference.
         self.add_period_constraint(self.lookup_request("ad9361_rfic:rx_clk_p", 0, loose=True), 1e9/self.rfic_clk_freq) # RF sample clock.
-        self.add_period_constraint(self.lookup_request("sync_clk_in",          0, loose=True), 1e9/10e6)           # External sync/debug clock.
+        self.add_period_constraint(self.lookup_request("sync_clk_in",          0, loose=True), 1e9/getattr(self, "sync_ref_freq", 10e6)) # External sync/debug clock (shared reference).
